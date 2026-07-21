@@ -12,8 +12,8 @@ import (
 	"github.com/naka-meet/sfu/pkg/auth"
 	"github.com/naka-meet/sfu/pkg/room"
 	"github.com/naka-meet/sfu/pkg/webrtc"
+	pion "github.com/pion/webrtc/v4"
 )
-
 
 type SignalMessage struct {
 	Type      string          `json:"type"`
@@ -78,6 +78,21 @@ func (h *Handler) broadcastToRoom(roomSlug, senderID string, message []byte) {
 	}
 }
 
+func (h *Handler) AddTrackAndRenegotiate(roomSlug, publisherID string, track pion.TrackLocal) {
+	h.router.BroadcastTrackAndRenegotiate(roomSlug, publisherID, track, func(targetUserID, offerSDP string) {
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+		if roomConns, exists := h.conns[roomSlug]; exists {
+			if c, found := roomConns[targetUserID]; found {
+				msgBytes, _ := json.Marshal(map[string]interface{}{
+					"type": "offer",
+					"sdp":  offerSDP,
+				})
+				_ = c.WriteMessage(websocket.TextMessage, msgBytes)
+			}
+		}
+	})
+}
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Enable CORS for cross-origin frontend (Port 3000 -> 8080)
@@ -138,7 +153,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		JoinedAt: time.Now(),
 	}
 
-
 	_, _ = h.rm.CreateOrGetRoom(r.Context(), roomSlug, claims.UserID)
 	if err := h.rm.AddParticipant(r.Context(), roomSlug, p); err != nil {
 		log.Printf("Failed to add participant to room: %v", err)
@@ -147,7 +161,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.rm.HandleDisconnect(roomSlug, claims.UserID, 15*time.Second)
 
 	// 4. Create PeerConnection in Pion Router
-	_, err = h.router.AddPeer(claims.UserID)
+	pc, err := h.router.AddPeer(claims.UserID)
 	if err != nil {
 		log.Printf("Failed to create PeerConnection: %v", err)
 		return
@@ -155,6 +169,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.registerConn(roomSlug, claims.UserID, conn)
 	defer h.unregisterConn(roomSlug, claims.UserID)
+
+	// Attach ICE Candidate Listener on backend PeerConnection
+	pc.OnICECandidate(func(c *pion.ICECandidate) {
+		if c == nil {
+			return
+		}
+		candJSON := c.ToJSON()
+		msgBytes, _ := json.Marshal(map[string]interface{}{
+			"type":      "candidate",
+			"candidate": candJSON,
+		})
+		_ = conn.WriteMessage(websocket.TextMessage, msgBytes)
+	})
+
+	// Attach OnTrack Listener on backend PeerConnection for RTP track forwarding
+	pc.OnTrack(func(remoteTrack *pion.TrackRemote, receiver *pion.RTPReceiver) {
+		localTrack, err := pion.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, remoteTrack.ID(), remoteTrack.StreamID())
+		if err != nil {
+			log.Printf("Failed to create local track: %v", err)
+			return
+		}
+
+		// Forward RTP Packets in Goroutine
+		go func(remote *pion.TrackRemote, local *pion.TrackLocalStaticRTP) {
+			buf := make([]byte, 1500)
+			for {
+				i, _, readErr := remote.Read(buf)
+				if readErr != nil {
+					break
+				}
+				if _, writeErr := local.Write(buf[:i]); writeErr != nil {
+					break
+				}
+			}
+		}(remoteTrack, localTrack)
+
+		// Broadcast track to all other room participants & trigger SDP renegotiation
+		h.AddTrackAndRenegotiate(roomSlug, claims.UserID, localTrack)
+	})
 
 	// 5. Message Loop
 	for {
@@ -170,15 +223,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.Type {
 		case "offer":
-			// Offer processing
+			if pc != nil && msg.SDP != "" {
+				offer := pion.SessionDescription{
+					Type: pion.SDPTypeOffer,
+					SDP:  msg.SDP,
+				}
+				if err := pc.SetRemoteDescription(offer); err == nil {
+					// Subscribe peer to any pre-existing active room tracks
+					_, _ = h.router.SubscribePeerToRoomTracks(roomSlug, claims.UserID)
+
+					answer, err := pc.CreateAnswer(nil)
+					if err == nil {
+						if err := pc.SetLocalDescription(answer); err == nil {
+							ansBytes, _ := json.Marshal(map[string]interface{}{
+								"type": "answer",
+								"sdp":  answer.SDP,
+							})
+							_ = conn.WriteMessage(websocket.TextMessage, ansBytes)
+						}
+					}
+				}
+			}
 		case "answer":
-			// Answer processing
+			if pc != nil && msg.SDP != "" {
+				answer := pion.SessionDescription{
+					Type: pion.SDPTypeAnswer,
+					SDP:  msg.SDP,
+				}
+				_ = pc.SetRemoteDescription(answer)
+			}
 		case "candidate":
-			// Candidate processing
+			if pc != nil && len(msg.Candidate) > 0 {
+				var candInit pion.ICECandidateInit
+				if err := json.Unmarshal(msg.Candidate, &candInit); err == nil {
+					_ = pc.AddICECandidate(candInit)
+				}
+			}
+
 		case "track_metadata":
 			// BR4 Out-of-band labeling: broadcast metadata to all participants in room
 			h.broadcastToRoom(roomSlug, claims.UserID, messageBytes)
 		}
 	}
 }
-

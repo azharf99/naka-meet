@@ -71,13 +71,13 @@ const VideoTile: React.FC<{
 
     checkTracks();
 
-    if (videoRef.current && stream) {
+    if (videoRef.current && stream && videoRef.current.srcObject !== stream) {
       videoRef.current.srcObject = stream;
     }
 
     const interval = setInterval(checkTracks, 1000);
     return () => clearInterval(interval);
-  }, [stream]);
+  }, [stream, hasVideo]);
 
   const initials = getInitials(label);
   const showVideoFallback = !isScreen && (!stream || !hasVideo);
@@ -85,15 +85,14 @@ const VideoTile: React.FC<{
 
   return (
     <div className={`relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center ${isScreen ? 'w-full h-full min-h-[400px]' : 'w-full aspect-video min-h-[200px]'}`}>
-      {!showVideoFallback ? (
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted={label.includes('You')}
-          className={`w-full h-full ${isScreen ? 'object-contain' : 'object-cover'}`}
-        />
-      ) : (
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={label.includes('You')}
+        className={`w-full h-full ${isScreen ? 'object-contain' : 'object-cover'} ${showVideoFallback ? 'hidden' : 'block'}`}
+      />
+      {showVideoFallback && (
         <div className="flex flex-col items-center justify-center gap-3 text-slate-400 p-6 select-none">
           <div className="w-20 h-20 rounded-full bg-slate-800 border-2 border-slate-700/80 flex items-center justify-center text-2xl font-bold text-slate-200 shadow-xl tracking-wider">
             {initials}
@@ -101,6 +100,7 @@ const VideoTile: React.FC<{
           <span className="text-xs text-slate-300 font-medium tracking-wide">{label}</span>
         </div>
       )}
+
 
       {/* Floating Participant Tag */}
       <div className="absolute bottom-3 left-3 px-3 py-1 bg-slate-950/80 backdrop-blur-md rounded-lg text-xs font-medium text-slate-200 border border-slate-800 flex items-center gap-2">

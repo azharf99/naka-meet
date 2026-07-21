@@ -38,8 +38,10 @@ Object.defineProperty(globalThis, 'navigator', {
         getTracks: () => [],
       }),
       getDisplayMedia: vi.fn().mockResolvedValue({
-        getTracks: () => [{ id: 'screen-1', label: 'Screen Share' }],
+        id: 'screen-stream-1',
+        getTracks: () => [{ id: 'screen-1', label: 'Screen Share', stop: vi.fn() }],
       }),
+
     },
   },
   writable: true,
@@ -66,4 +68,19 @@ describe('WebRTCService Audit & Unit Tests', () => {
     expect(received).not.toBeNull();
     expect(received.text).toBe('Hello WebRTC');
   });
+
+  test('stopScreenShare stops screen tracks and triggers onScreenShareEnded callback', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let ended = false;
+    service.onScreenShareEnded = () => {
+      ended = true;
+    };
+
+    await service.startScreenShare();
+    service.stopScreenShare();
+    expect(ended).toBe(true);
+  });
 });
+

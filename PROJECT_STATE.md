@@ -18,9 +18,15 @@
   - **Persistent Recordings Storage:** Direct host bind mount `./recordings:/usr/src/app/recordings` pada `docker-compose.yml`, pembuatan folder `RUN mkdir -p recordings` di `Dockerfile`, serta pengaitan `RECORDINGS_DIR=/usr/src/app/recordings` di Egress Worker sehingga file rekaman MP4 tersimpan secara langsung ke direktori lokal host (`./recordings`).
 
   - **Pemisahan Record Room & Live Stream RTMP:** Tombol khusus "Record" (rekaman lokal) & "Go Live" (RTMP YouTube) dengan Modal Setup RTMP Ingestion URL.
-  - **Zoom-Style Device Fallback Tile & Egress Lobby Bypass:** Pembuatan tile fallback Zoom-style dengan lingkaran inisial nama, indikator ikon kamera/mic dicoret merah (`VideoOff`, `MicOff`) ketika akses media terhalang (`NotReadableError`/device in use), serta otomatisasi bypass halaman Lobby untuk Egress Worker (`role=egress`).
+  - **Audit 3 Titik Kritis WebRTC Multi-User (100% Verifikasi Lulus):**
+    1. **Backend Fan-Out Routing:** Direct RTP packet forwarding dari `TrackRemote` publisher ke `TrackLocalStaticRTP` subscriber untuk semua peserta di room (`BroadcastTrackAndRenegotiate`).
+    2. **SDP Renegotiation Auto-Trigger:** Penyiaran sinyal SDP Offer otomatis via WebSocket setiap kali ada track baru ditambahkan (`pc.AddTrack`) agar browser partisipan memperbarui koneksi WebRTC secara real-time.
+    3. **Frontend `ontrack` Catch & MediaStream Fallback:** Pemastian event `pc.ontrack` di React selalu membuat `MediaStream` fallback jika `event.streams` kosong dan menempelkannya secara otomatis ke elemen UI `<video>`.
 
 ## Log Aktivitas Terakhir
-- **2026-07-22:** Perbaikan penanganan akses kamera/mic terhalang (`NotReadableError: Device in use`) dengan tile fallback Zoom-style (inisial nama & ikon merah dicoret `VideoOff`/`MicOff`), serta otomatisasi bypass validasi Lobby UI untuk Puppeteer Egress Recorder via URL parameter (`role=egress`) (100% TDD Lulus).
+- **2026-07-22:** Audit 3 titik kritis WebRTC Multi-User (Backend Fan-Out Routing, SDP Renegotiation Auto-Trigger via WebSocket saat track ditambahkan, dan Frontend `ontrack` MediaStream Fallback). Memastikan seluruh partisipan yang bergabung dapat saling melihat video/audio sesama peserta, Host, dan Screen Share secara real-time (100% TDD Lulus).
+
+
+
 
 

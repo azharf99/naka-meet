@@ -10,9 +10,11 @@ interface ControlsProps {
   userRole?: string;
   isRecording?: boolean;
   isLiveStreaming?: boolean;
+  isScreenSharing?: boolean;
   onToggleMic: () => void;
   onToggleCam: () => void;
   onScreenShare: () => void;
+  onStopScreenShare?: () => void;
   onToggleChat: () => void;
   onStartRecording: () => void;
   onStartRTMP: (url: string) => void;
@@ -24,9 +26,11 @@ export const Controls: React.FC<ControlsProps> = ({
   userRole = 'host',
   isRecording = false,
   isLiveStreaming = false,
+  isScreenSharing = false,
   onToggleMic,
   onToggleCam,
   onScreenShare,
+  onStopScreenShare,
   onToggleChat,
   onStartRecording,
   onStartRTMP,
@@ -88,12 +92,18 @@ export const Controls: React.FC<ControlsProps> = ({
 
         {/* Screen Share */}
         <button
-          onClick={onScreenShare}
-          className="p-3 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl transition-all duration-200"
-          title="Share Screen"
+          onClick={isScreenSharing ? (onStopScreenShare || onScreenShare) : onScreenShare}
+          className={`p-3 rounded-xl transition-all duration-200 flex items-center gap-2 ${
+            isScreenSharing
+              ? 'bg-indigo-600 hover:bg-indigo-500 text-white animate-pulse shadow-lg shadow-indigo-600/30'
+              : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+          }`}
+          title={isScreenSharing ? 'Stop Sharing Screen' : 'Share Screen'}
         >
-          <Monitor className="w-5 h-5 text-indigo-400" />
+          <Monitor className={`w-5 h-5 ${isScreenSharing ? 'text-white' : 'text-indigo-400'}`} />
+          {isScreenSharing && <span className="text-xs font-semibold pr-1">Stop Sharing</span>}
         </button>
+
 
         {/* DataChannel Chat */}
         <button

@@ -26,6 +26,7 @@ export const App: React.FC = () => {
   const [inputText, setInputText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [isLiveStreaming, setIsLiveStreaming] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
 
 
 
@@ -75,6 +76,8 @@ export const App: React.FC = () => {
     webrtcService?.disconnect();
     setWebrtcService(null);
     setLocalStream(null);
+    setLocalScreenStream(null);
+    setIsScreenSharing(false);
     setRemoteTracks([]);
     setMessages([]);
     setInMeeting(false);
@@ -93,6 +96,15 @@ export const App: React.FC = () => {
 
         service.onTrackAdded = (track) => {
           setRemoteTracks((prev) => [...prev.filter((t) => t.id !== track.id), track]);
+        };
+
+        service.onTrackRemoved = (trackId) => {
+          setRemoteTracks((prev) => prev.filter((t) => t.id !== trackId && t.stream?.id !== trackId));
+        };
+
+        service.onScreenShareEnded = () => {
+          setLocalScreenStream(null);
+          setIsScreenSharing(false);
         };
 
         service.onMessageReceived = (msg) => {
@@ -202,6 +214,8 @@ export const App: React.FC = () => {
           localStream={localStream}
           localScreenStream={localScreenStream}
           remoteTracks={remoteTracks}
+          displayName={displayName}
+          userRole={userRole}
         />
 
         {/* Real-time Chat Drawer (WebRTC DataChannel) */}
@@ -259,6 +273,7 @@ export const App: React.FC = () => {
         userRole={userRole}
         isRecording={isRecording}
         isLiveStreaming={isLiveStreaming}
+        isScreenSharing={isScreenSharing}
         onToggleMic={() => {
           if (localStream) {
             localStream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
@@ -273,7 +288,13 @@ export const App: React.FC = () => {
           const screenStream = await webrtcService?.startScreenShare();
           if (screenStream) {
             setLocalScreenStream(screenStream);
+            setIsScreenSharing(true);
           }
+        }}
+        onStopScreenShare={() => {
+          webrtcService?.stopScreenShare();
+          setLocalScreenStream(null);
+          setIsScreenSharing(false);
         }}
         onToggleChat={() => setChatOpen(!chatOpen)}
         onStartRecording={handleStartRecording}
@@ -281,6 +302,7 @@ export const App: React.FC = () => {
         onStopEgress={handleStopEgress}
         onLeave={handleLeaveRoom}
       />
+
 
 
     </div>

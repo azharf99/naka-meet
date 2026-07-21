@@ -16,9 +16,12 @@ export class WebRTCService {
   private screenStream: MediaStream | null = null;
 
   public onTrackAdded?: TrackCallback;
+  public onTrackRemoved?: (trackId: string) => void;
+  public onScreenShareEnded?: () => void;
   public onMessageReceived?: MessageCallback;
 
   constructor(private roomSlug: string) {}
+
 
   public async connectToken(token: string): Promise<void> {
     // 1. Get Local Media (Camera + Mic)
@@ -84,8 +87,8 @@ export class WebRTCService {
 
     // Handle Remote Track
     this.pc.ontrack = (event) => {
-      const [stream] = event.streams;
-      if (stream && this.onTrackAdded) {
+      const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+      if (this.onTrackAdded) {
         const isScreen =
           stream.id.includes('screen') ||
           event.track.label.toLowerCase().includes('screen') ||
@@ -98,6 +101,7 @@ export class WebRTCService {
         });
       }
     };
+
 
     // Setup WebSocket Signaling
     const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
@@ -130,11 +134,12 @@ export class WebRTCService {
             stream: new MediaStream(),
             isScreenShare: true,
           });
+        } else if (msg.kind === 'screen_stopped' && msg.stream_id && this.onTrackRemoved) {
+          this.onTrackRemoved(msg.stream_id);
         }
       }
     };
   }
-
 
   private setupDataChannelEvents(dc: RTCDataChannel) {
     dc.onmessage = (event) => {
@@ -152,10 +157,13 @@ export class WebRTCService {
   public async startScreenShare(): Promise<MediaStream | null> {
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-      if (this.pc && this.screenStream) {
+      if (this.screenStream) {
         this.screenStream.getTracks().forEach((track) => {
-          if (this.screenStream) {
-            this.pc?.addTrack(track, this.screenStream);
+          track.onended = () => {
+            this.stopScreenShare();
+          };
+          if (this.pc && this.screenStream) {
+            this.pc.addTrack(track, this.screenStream);
           }
         });
       }
@@ -177,6 +185,32 @@ export class WebRTCService {
       return null;
     }
   }
+
+  public stopScreenShare(): void {
+    if (this.screenStream) {
+      const streamId = this.screenStream.id;
+      this.screenStream.getTracks().forEach((t) => {
+        if (t && typeof t.stop === 'function') {
+          t.stop();
+        }
+      });
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(
+          JSON.stringify({
+            type: 'track_metadata',
+            stream_id: streamId,
+            kind: 'screen_stopped',
+          })
+        );
+      }
+      this.screenStream = null;
+    }
+    if (this.onScreenShareEnded) {
+      this.onScreenShareEnded();
+    }
+  }
+
+
 
   public sendMessage(text: string): void {
     if (this.dataChannel && this.dataChannel.readyState === 'open') {

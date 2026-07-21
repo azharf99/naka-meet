@@ -25,6 +25,9 @@ RUN npm install
 
 COPY . .
 
+RUN mkdir -p recordings
+
+
 RUN echo '#!/bin/bash\n\
 Xvfb :99 -screen 0 1920x1080x24 -ac & \n\
 sleep 2\n\

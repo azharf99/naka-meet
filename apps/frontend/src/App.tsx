@@ -18,7 +18,9 @@ export const App: React.FC = () => {
 
   const [webrtcService, setWebrtcService] = useState<WebRTCService | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const [remoteTracks, setRemoteTracks] = useState<ParticipantTrack[]>([]);
+
   const [chatOpen, setChatOpen] = useState(false);
   const [messages, setMessages] = useState<Array<{ sender: string; text: string; time: string }>>([]);
   const [inputText, setInputText] = useState('');
@@ -187,7 +189,11 @@ export const App: React.FC = () => {
 
       {/* Main Video Area */}
       <main className="flex-1 flex pt-16 relative">
-        <VideoGrid localStream={localStream} remoteTracks={remoteTracks} />
+        <VideoGrid
+          localStream={localStream}
+          localScreenStream={localScreenStream}
+          remoteTracks={remoteTracks}
+        />
 
         {/* Real-time Chat Drawer (WebRTC DataChannel) */}
         {chatOpen && (
@@ -254,13 +260,19 @@ export const App: React.FC = () => {
             localStream.getVideoTracks().forEach((t) => (t.enabled = !t.enabled));
           }
         }}
-        onScreenShare={() => webrtcService?.startScreenShare()}
+        onScreenShare={async () => {
+          const screenStream = await webrtcService?.startScreenShare();
+          if (screenStream) {
+            setLocalScreenStream(screenStream);
+          }
+        }}
         onToggleChat={() => setChatOpen(!chatOpen)}
         onStartRecording={handleStartRecording}
         onStartRTMP={handleStartRTMP}
         onStopEgress={handleStopEgress}
         onLeave={handleLeaveRoom}
       />
+
 
     </div>
   );

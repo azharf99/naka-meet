@@ -67,10 +67,9 @@ services:
     env_file:
       - .env
     environment:
-      - RECORDINGS_DIR=/app/recordings
+      - RECORDINGS_DIR=/usr/src/app/recordings
     volumes:
-      - ./recordings:/app/recordings
-      - recordings_data:/app/recordings
+      - ./recordings:/usr/src/app/recordings
     depends_on:
       redis:
         condition: service_healthy
@@ -90,5 +89,5 @@ networks:
 
 volumes:
   pgdata:
-  recordings_data:
+
 

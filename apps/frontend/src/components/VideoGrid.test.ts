@@ -21,4 +21,16 @@ describe('VideoGrid Helper Tests', () => {
     expect(deduplicated[0].peerID).toBe('peer-1');
     expect(deduplicated[1].peerID).toBe('peer-2');
   });
+
+  test('deduplicateTracks preserves isScreenShare flag for BR4 Stage Mode', () => {
+    const tracks = [
+      { id: 'v1', peerID: 'peer-1', stream: { id: 'stream-1' } as any, isScreenShare: false },
+      { id: 's1', peerID: 'peer-1', stream: { id: 'stream-screen' } as any, isScreenShare: true },
+    ];
+    const deduplicated = deduplicateTracks(tracks);
+    const screenTrack = deduplicated.find((t) => t.isScreenShare);
+    expect(screenTrack).toBeDefined();
+    expect(screenTrack?.isScreenShare).toBe(true);
+  });
 });
+

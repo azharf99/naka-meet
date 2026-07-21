@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -12,6 +13,7 @@ import (
 	"github.com/naka-meet/sfu/pkg/room"
 	"github.com/naka-meet/sfu/pkg/webrtc"
 )
+
 
 type SignalMessage struct {
 	Type      string          `json:"type"`
@@ -26,6 +28,8 @@ type Handler struct {
 	router    *webrtc.SFURouter
 	jwtSecret []byte
 	upgrader  websocket.Upgrader
+	conns     map[string]map[string]*websocket.Conn
+	mu        sync.RWMutex
 }
 
 func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte) *Handler {
@@ -38,8 +42,42 @@ func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte
 				return true
 			},
 		},
+		conns: make(map[string]map[string]*websocket.Conn),
 	}
 }
+
+func (h *Handler) registerConn(roomSlug, userID string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.conns[roomSlug]; !exists {
+		h.conns[roomSlug] = make(map[string]*websocket.Conn)
+	}
+	h.conns[roomSlug][userID] = conn
+}
+
+func (h *Handler) unregisterConn(roomSlug, userID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if roomConns, exists := h.conns[roomSlug]; exists {
+		delete(roomConns, userID)
+		if len(roomConns) == 0 {
+			delete(h.conns, roomSlug)
+		}
+	}
+}
+
+func (h *Handler) broadcastToRoom(roomSlug, senderID string, message []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if roomConns, exists := h.conns[roomSlug]; exists {
+		for uid, c := range roomConns {
+			if uid != senderID {
+				_ = c.WriteMessage(websocket.TextMessage, message)
+			}
+		}
+	}
+}
+
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Enable CORS for cross-origin frontend (Port 3000 -> 8080)
@@ -115,6 +153,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.registerConn(roomSlug, claims.UserID, conn)
+	defer h.unregisterConn(roomSlug, claims.UserID)
+
 	// 5. Message Loop
 	for {
 		_, messageBytes, err := conn.ReadMessage()
@@ -135,7 +176,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "candidate":
 			// Candidate processing
 		case "track_metadata":
-			// Out-of-band labeling
+			// BR4 Out-of-band labeling: broadcast metadata to all participants in room
+			h.broadcastToRoom(roomSlug, claims.UserID, messageBytes)
 		}
 	}
 }
+

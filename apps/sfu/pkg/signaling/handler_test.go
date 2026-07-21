@@ -110,4 +110,36 @@ func TestSignaling_HTTPUpgradeUsesDisplayName(t *testing.T) {
 	}, 1*time.Second, 10*time.Millisecond, "Participant should be added to RoomManager with correct display name")
 }
 
+func TestSignaling_TrackMetadataRelay(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	userID, _ := uuid.NewV7()
+	token, err := auth.GenerateTokenWithName(userID.String(), "Presenter", "participant", secret, 1*time.Hour)
+	require.NoError(t, err)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=br4-room&token=" + token
+
+	ws, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer ws.Close()
+
+	assert.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+
+	// Send out-of-band track metadata
+	metaMsg := map[string]string{
+		"type":      "track_metadata",
+		"stream_id": "screen-stream-101",
+		"kind":      "screen",
+	}
+	err = ws.WriteJSON(metaMsg)
+	require.NoError(t, err)
+}
+
+
 

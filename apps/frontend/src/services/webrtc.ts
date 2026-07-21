@@ -79,11 +79,17 @@ export class WebRTCService {
       this.setupDataChannelEvents(event.channel);
     };
 
+    const streamMetadataMap = new Map<string, string>();
+
+
     // Handle Remote Track
     this.pc.ontrack = (event) => {
       const [stream] = event.streams;
       if (stream && this.onTrackAdded) {
-        const isScreen = stream.id.includes('screen') || event.track.label.toLowerCase().includes('screen');
+        const isScreen =
+          stream.id.includes('screen') ||
+          event.track.label.toLowerCase().includes('screen') ||
+          streamMetadataMap.get(stream.id) === 'screen';
         this.onTrackAdded({
           id: event.track.id,
           peerID: stream.id || 'remote-peer',
@@ -112,9 +118,23 @@ export class WebRTCService {
         await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
       } else if (msg.type === 'candidate' && this.pc) {
         await this.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      } else if (msg.type === 'track_metadata') {
+        // BR4: Handle out-of-band screen track metadata from Pion SFU
+        if (msg.stream_id && msg.kind) {
+          streamMetadataMap.set(msg.stream_id, msg.kind);
+        }
+        if (msg.kind === 'screen' && msg.stream_id && this.onTrackAdded) {
+          this.onTrackAdded({
+            id: msg.stream_id,
+            peerID: msg.peer_id || 'remote-presenter',
+            stream: new MediaStream(),
+            isScreenShare: true,
+          });
+        }
       }
     };
   }
+
 
   private setupDataChannelEvents(dc: RTCDataChannel) {
     dc.onmessage = (event) => {

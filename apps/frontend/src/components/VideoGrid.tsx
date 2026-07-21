@@ -3,6 +3,7 @@ import { ParticipantTrack } from '../services/webrtc';
 
 interface VideoGridProps {
   localStream: MediaStream | null;
+  localScreenStream?: MediaStream | null;
   remoteTracks: ParticipantTrack[];
 }
 
@@ -47,7 +48,7 @@ const VideoTile: React.FC<{ stream: MediaStream; label: string; isScreen?: boole
   }, [stream]);
 
   return (
-    <div className={`relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center ${isScreen ? 'w-full h-full' : 'w-full aspect-video min-h-[200px]'}`}>
+    <div className={`relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center ${isScreen ? 'w-full h-full min-h-[400px]' : 'w-full aspect-video min-h-[200px]'}`}>
       <video
         ref={videoRef}
         autoPlay
@@ -63,15 +64,19 @@ const VideoTile: React.FC<{ stream: MediaStream; label: string; isScreen?: boole
   );
 };
 
-export const VideoGrid: React.FC<VideoGridProps> = ({ localStream, remoteTracks }) => {
+export const VideoGrid: React.FC<VideoGridProps> = ({ localStream, localScreenStream, remoteTracks }) => {
   const uniqueTracks = deduplicateTracks(remoteTracks);
-  const screenTrack = uniqueTracks.find((t) => t.isScreenShare);
+  const remoteScreenTrack = uniqueTracks.find((t) => t.isScreenShare);
 
-  if (screenTrack) {
+  const activePresentationStream = localScreenStream || remoteScreenTrack?.stream;
+  const presentationLabel = localScreenStream ? 'Your Screen Presentation' : 'Presentation Screen';
+
+  // BR4: Stage Mode rendering when screen track or out-of-band metadata screen track is active
+  if (activePresentationStream) {
     return (
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 h-[calc(100vh-80px)]">
         <div className="lg:col-span-3 h-full">
-          <VideoTile stream={screenTrack.stream} label="Presentation Screen" isScreen />
+          <VideoTile stream={activePresentationStream} label={presentationLabel} isScreen />
         </div>
         <div className="flex flex-col gap-3 overflow-y-auto pr-1">
           {localStream && <VideoTile stream={localStream} label="You (Host)" />}

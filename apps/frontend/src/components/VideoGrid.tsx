@@ -6,6 +6,33 @@ interface VideoGridProps {
   remoteTracks: ParticipantTrack[];
 }
 
+export function getGridClass(totalTiles: number): string {
+  if (totalTiles <= 1) {
+    return 'grid-cols-1 max-w-4xl w-full mx-auto';
+  }
+  if (totalTiles === 2) {
+    return 'grid-cols-1 md:grid-cols-2';
+  }
+  if (totalTiles <= 4) {
+    return 'grid-cols-2 md:grid-cols-2';
+  }
+  if (totalTiles <= 9) {
+    return 'grid-cols-2 md:grid-cols-3';
+  }
+  return 'grid-cols-2 md:grid-cols-4';
+}
+
+export function deduplicateTracks(remoteTracks: ParticipantTrack[]): ParticipantTrack[] {
+  const map = new Map<string, ParticipantTrack>();
+  for (const track of remoteTracks) {
+    const key = track.stream?.id || track.peerID || track.id;
+    if (!map.has(key) || track.isScreenShare) {
+      map.set(key, track);
+    }
+  }
+  return Array.from(map.values());
+}
+
 const VideoTile: React.FC<{ stream: MediaStream; label: string; isScreen?: boolean }> = ({
   stream,
   label,
@@ -20,7 +47,7 @@ const VideoTile: React.FC<{ stream: MediaStream; label: string; isScreen?: boole
   }, [stream]);
 
   return (
-    <div className={`relative overflow-hidden rounded-xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center ${isScreen ? 'w-full h-full' : 'aspect-video'}`}>
+    <div className={`relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center ${isScreen ? 'w-full h-full' : 'w-full aspect-video min-h-[200px]'}`}>
       <video
         ref={videoRef}
         autoPlay
@@ -37,21 +64,18 @@ const VideoTile: React.FC<{ stream: MediaStream; label: string; isScreen?: boole
 };
 
 export const VideoGrid: React.FC<VideoGridProps> = ({ localStream, remoteTracks }) => {
-  // BR4: Cek apakah ada screen share track aktif
-  const screenTrack = remoteTracks.find((t) => t.isScreenShare);
+  const uniqueTracks = deduplicateTracks(remoteTracks);
+  const screenTrack = uniqueTracks.find((t) => t.isScreenShare);
 
   if (screenTrack) {
-    // Stage Mode (Presentation in Center + Picture-in-Picture Sidebar)
     return (
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 h-[calc(100vh-80px)]">
-        {/* Main Presentation Stage */}
         <div className="lg:col-span-3 h-full">
           <VideoTile stream={screenTrack.stream} label="Presentation Screen" isScreen />
         </div>
-        {/* Participant Sidebar */}
         <div className="flex flex-col gap-3 overflow-y-auto pr-1">
           {localStream && <VideoTile stream={localStream} label="You (Host)" />}
-          {remoteTracks
+          {uniqueTracks
             .filter((t) => !t.isScreenShare)
             .map((track) => (
               <VideoTile key={track.id} stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />
@@ -61,16 +85,17 @@ export const VideoGrid: React.FC<VideoGridProps> = ({ localStream, remoteTracks 
     );
   }
 
-  // Grid Mode Default
-  const totalTiles = (localStream ? 1 : 0) + remoteTracks.length;
-  const gridCols = totalTiles <= 1 ? 'grid-cols-1' : totalTiles <= 4 ? 'grid-cols-2' : 'grid-cols-3';
+  const totalTiles = (localStream ? 1 : 0) + uniqueTracks.length;
+  const gridClass = getGridClass(totalTiles);
 
   return (
-    <div className={`flex-1 grid ${gridCols} gap-4 p-4 items-center justify-center overflow-y-auto h-[calc(100vh-80px)]`}>
-      {localStream && <VideoTile stream={localStream} label="You (Host)" />}
-      {remoteTracks.map((track) => (
-        <VideoTile key={track.id} stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />
-      ))}
+    <div className="flex-1 p-6 overflow-y-auto h-[calc(100vh-80px)] flex items-center justify-center">
+      <div className={`grid ${gridClass} gap-4 w-full justify-center items-center max-w-7xl`}>
+        {localStream && <VideoTile stream={localStream} label="You (Host)" />}
+        {uniqueTracks.map((track) => (
+          <VideoTile key={track.id} stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />
+        ))}
+      </div>
     </div>
   );
 };

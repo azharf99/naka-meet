@@ -22,7 +22,10 @@ export const App: React.FC = () => {
   const [chatOpen, setChatOpen] = useState(false);
   const [messages, setMessages] = useState<Array<{ sender: string; text: string; time: string }>>([]);
   const [inputText, setInputText] = useState('');
-  const [isEgressActive, setIsEgressActive] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isLiveStreaming, setIsLiveStreaming] = useState(false);
+
+
 
   const handleJoinRoom = async (name: string, targetRoomSlug: string, role: string) => {
     try {
@@ -107,8 +110,7 @@ export const App: React.FC = () => {
     setInputText('');
   };
 
-  const handleTriggerEgress = async () => {
-    const nextAction = isEgressActive ? 'STOP_EGRESS' : 'START_RECORDING';
+  const sendEgressCommand = async (action: string, url?: string) => {
     try {
       const res = await fetch(`/api/v1/rooms/${roomSlug}/live`, {
         method: 'POST',
@@ -117,17 +119,31 @@ export const App: React.FC = () => {
           Authorization: `Bearer ${token}`,
         },
         credentials: 'include',
-        body: JSON.stringify({ action: nextAction }),
+        body: JSON.stringify({ action, url }),
       });
       if (res.ok) {
-        setIsEgressActive(!isEgressActive);
+        if (action === 'START_RECORDING') {
+          setIsRecording(true);
+          setIsLiveStreaming(false);
+        } else if (action === 'START_RTMP') {
+          setIsLiveStreaming(true);
+          setIsRecording(false);
+        } else if (action === 'STOP_EGRESS') {
+          setIsRecording(false);
+          setIsLiveStreaming(false);
+        }
       } else {
-        console.error('Egress trigger failed', await res.text());
+        console.error('Egress command failed', await res.text());
       }
     } catch (err) {
-      console.error('Failed to trigger egress', err);
+      console.error('Failed to send egress command', err);
     }
   };
+
+  const handleStartRecording = () => sendEgressCommand('START_RECORDING');
+  const handleStartRTMP = (url: string) => sendEgressCommand('START_RTMP', url);
+  const handleStopEgress = () => sendEgressCommand('STOP_EGRESS');
+
 
   if (!inMeeting) {
     return (
@@ -226,6 +242,8 @@ export const App: React.FC = () => {
       {/* Control Bar */}
       <Controls
         userRole={userRole}
+        isRecording={isRecording}
+        isLiveStreaming={isLiveStreaming}
         onToggleMic={() => {
           if (localStream) {
             localStream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
@@ -238,9 +256,12 @@ export const App: React.FC = () => {
         }}
         onScreenShare={() => webrtcService?.startScreenShare()}
         onToggleChat={() => setChatOpen(!chatOpen)}
-        onTriggerEgress={handleTriggerEgress}
+        onStartRecording={handleStartRecording}
+        onStartRTMP={handleStartRTMP}
+        onStopEgress={handleStopEgress}
         onLeave={handleLeaveRoom}
       />
+
     </div>
   );
 };

@@ -13,6 +13,10 @@
 - [x] **Audit Fase 3 (Node.js Egress Worker):** Puppeteer Headless + FFmpeg RTMP FLV format support + Audio fallback (lavfi anullsrc) + `channel:egress_status` pubsub + 5-min auto-stop BR2 + Unit Tests (4/4 Tests Pass)
 - [x] **Audit Fase 4 (Docker & E2E Integration):** PostgreSQL auto-migration GORM (`users`, `rooms`, `recordings` dengan UUID v7), Nginx Reverse Proxy, full container dependency healthchecks, & End-to-End verification.
 
-## Log Aktivitas Terakhir
-- Implementasi Multi-User Authentication & Lobby UI: User dapat masuk sebagai Guest tanpa registrasi menggunakan Display Name dan Room Slug untuk bergabung, atau masuk sebagai Host untuk membuat dan mengontrol ruangan beserta izin Egress (100% TDD Lulus).
+- [x] **Perbaikan Dynamic Layout, Persistent Storage & RTMP Live Streaming (100% TDD Lulus):**
+  - **Dynamic Video Grid:** Deduplikasi track peserta dan penyesuaian CSS grid dinamis (1 tile per peserta, 1/2/4/9/10+ responsive layout).
+  - **Persistent Recordings Storage:** Mounting Docker volume `recordings_data:/app/recordings` dan `./recordings:/app/recordings` pada `docker-compose.yml` serta pengaitan `RECORDINGS_DIR` di Egress Worker.
+  - **Pemisahan Record Room & Live Stream RTMP:** Tombol khusus "Record" (rekaman lokal) & "Go Live" (RTMP YouTube) dengan Modal Setup RTMP Ingestion URL.
 
+## Log Aktivitas Terakhir
+- **2026-07-22:** Implementasi perbaikan Dynamic Video Grid Layout, Penyimpanan Persisten Video Rekaman via Docker Compose Volume, serta Pemisahan Tombol & Fitur Recording vs Live Streaming RTMP YouTube dengan Modal Configuration (100% TDD Lulus di Go SFU, Egress Node, & React Frontend).

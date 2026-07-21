@@ -1,8 +1,30 @@
 const { spawn } = require('child_process');
 const puppeteer = require('puppeteer');
 const Redis = require('ioredis');
+const path = require('path');
+const fs = require('fs');
+
+function resolveOutputPath(roomSlug, action, customUrl = '') {
+  if (action === 'START_RTMP' && customUrl) {
+    return customUrl;
+  }
+  const rawDir = process.env.RECORDINGS_DIR || path.join(__dirname, 'recordings');
+  const dir = rawDir.replace(/\\/g, '/');
+  if (fs && typeof fs.mkdirSync === 'function' && !fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {}
+  }
+  if (customUrl && !customUrl.startsWith('rtmp://') && !customUrl.startsWith('rtmps://')) {
+    return path.join(dir, customUrl).replace(/\\/g, '/');
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `${dir}/${roomSlug}_${timestamp}.mp4`;
+}
+
 
 function buildFFmpegArgs(roomSlug, outputUrl = 'output.mp4', options = {}) {
+
   const display = process.env.DISPLAY || ':99';
   const useDummyAudio = options.useDummyAudio !== undefined ? options.useDummyAudio : true;
 
@@ -78,7 +100,7 @@ class EgressWorker {
     const roomSlug = command.room || 'demo-room';
 
     if (action === 'START_RECORDING' || action === 'START_RTMP') {
-      const outputUrl = command.url || `${roomSlug}_recording.mp4`;
+      const outputUrl = resolveOutputPath(roomSlug, action, command.url);
       await this.startRecording(roomSlug, outputUrl);
     } else if (action === 'STOP_EGRESS') {
       console.log(`🛑 Stopping Egress for room ${roomSlug}...`);
@@ -199,4 +221,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = { EgressWorker, buildFFmpegArgs };
+module.exports = { EgressWorker, buildFFmpegArgs, resolveOutputPath };
+

@@ -116,6 +116,34 @@ func TestAPI_EgressTriggerHandler_StopEgress(t *testing.T) {
 	assert.Equal(t, "demo-room", payload["room"])
 }
 
+func TestAPI_EgressTriggerHandler_StartRTMP(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	handler := api.NewAPIHandler(secret, mockPub)
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateToken(hostID.String(), "host", secret, 1*time.Hour)
+
+	rtmpURL := "rtmp://a.rtmp.youtube.com/live2/key-xyz"
+	reqBody := `{"action":"START_RTMP","url":"` + rtmpURL + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/live", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+hostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var payload map[string]string
+	err := json.Unmarshal([]byte(mockPub.PublishedMessage), &payload)
+	require.NoError(t, err)
+	assert.Equal(t, "START_RTMP", payload["action"])
+	assert.Equal(t, "demo-room", payload["room"])
+	assert.Equal(t, rtmpURL, payload["url"])
+}
+
+
 func TestAPI_LoginHandler_GuestWithName(t *testing.T) {
 	secret := []byte("api-secret-key")
 	handler := api.NewAPIHandler(secret, nil)

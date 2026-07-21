@@ -18,8 +18,9 @@
   - **Persistent Recordings Storage:** Direct host bind mount `./recordings:/usr/src/app/recordings` pada `docker-compose.yml`, pembuatan folder `RUN mkdir -p recordings` di `Dockerfile`, serta pengaitan `RECORDINGS_DIR=/usr/src/app/recordings` di Egress Worker sehingga file rekaman MP4 tersimpan secara langsung ke direktori lokal host (`./recordings`).
 
   - **Pemisahan Record Room & Live Stream RTMP:** Tombol khusus "Record" (rekaman lokal) & "Go Live" (RTMP YouTube) dengan Modal Setup RTMP Ingestion URL.
-  - **Business Rule BR4 (Out-of-band Screen Track & Stage Mode):** Penyiaran WebSocket signaling `track_metadata` untuk jenis track `screen` dari Pion SFU ke seluruh peserta dalam room, dan otomatis merender UI dalam Stage Mode (Layar presentasi di panggung utama center + participant sidebar).
+  - **Zoom-Style Device Fallback Tile & Egress Lobby Bypass:** Pembuatan tile fallback Zoom-style dengan lingkaran inisial nama, indikator ikon kamera/mic dicoret merah (`VideoOff`, `MicOff`) ketika akses media terhalang (`NotReadableError`/device in use), serta otomatisasi bypass halaman Lobby untuk Egress Worker (`role=egress`).
 
 ## Log Aktivitas Terakhir
-- **2026-07-22:** Implementasi penuh Business Rule BR4 (Out-of-band WebSocket signaling `track_metadata` untuk screen share track & otomatisasi rendering Stage Mode), penyesuaian Dynamic Video Grid Layout, Penyimpanan Persisten Video Rekaman via Docker Compose Volume, serta Pemisahan Tombol & Fitur Recording vs Live Streaming RTMP YouTube (100% TDD Lulus di Go SFU, Egress Node, & React Frontend).
+- **2026-07-22:** Perbaikan penanganan akses kamera/mic terhalang (`NotReadableError: Device in use`) dengan tile fallback Zoom-style (inisial nama & ikon merah dicoret `VideoOff`/`MicOff`), serta otomatisasi bypass validasi Lobby UI untuk Puppeteer Egress Recorder via URL parameter (`role=egress`) (100% TDD Lulus).
+
 

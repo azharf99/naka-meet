@@ -62,6 +62,15 @@ export const App: React.FC = () => {
     }
   };
 
+  useEffect(() => {
+    const roleParam = urlParams.get('role');
+    const roomParam = urlParams.get('room');
+    if (roleParam === 'egress' && roomParam && !inMeeting) {
+      handleJoinRoom('Egress Recorder', roomParam, 'egress');
+    }
+  }, []);
+
+
   const handleLeaveRoom = () => {
     webrtcService?.disconnect();
     setWebrtcService(null);

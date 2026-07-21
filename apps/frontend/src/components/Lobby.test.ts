@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { validateJoinInput } from './Lobby';
+import { validateJoinInput, shouldAutoJoinEgress } from './Lobby';
 
 describe('Lobby Validation Logic Tests', () => {
 
@@ -8,4 +8,12 @@ describe('Lobby Validation Logic Tests', () => {
     expect(validateJoinInput('Budi', '').valid).toBe(false);
     expect(validateJoinInput('Budi', 'demo-room').valid).toBe(true);
   });
+
+  test('shouldAutoJoinEgress returns true when role=egress and room slug is present', () => {
+    expect(shouldAutoJoinEgress('egress', 'demo-room')).toBe(true);
+    expect(shouldAutoJoinEgress('host', 'demo-room')).toBe(false);
+    expect(shouldAutoJoinEgress('egress', '')).toBe(false);
+  });
 });
+
+

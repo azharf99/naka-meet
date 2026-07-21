@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { getGridClass, deduplicateTracks } from './VideoGrid';
+import { getGridClass, deduplicateTracks, getInitials } from './VideoGrid';
 
 describe('VideoGrid Helper Tests', () => {
   test('getGridClass assigns dynamic layout based on total participant count', () => {
@@ -32,5 +32,13 @@ describe('VideoGrid Helper Tests', () => {
     expect(screenTrack).toBeDefined();
     expect(screenTrack?.isScreenShare).toBe(true);
   });
+
+  test('getInitials calculates Zoom-style avatar initials correctly', () => {
+    expect(getInitials('Budi Ganteng')).toBe('BG');
+    expect(getInitials('Azhar')).toBe('AZ');
+    expect(getInitials('User (You)')).toBe('US');
+  });
 });
+
+
 

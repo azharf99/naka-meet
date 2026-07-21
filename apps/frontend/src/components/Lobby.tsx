@@ -7,6 +7,11 @@ export function validateJoinInput(name: string, roomSlug: string): { valid: bool
   return { valid: true };
 }
 
+export function shouldAutoJoinEgress(role: string, roomSlug: string): boolean {
+  return role === 'egress' && !!roomSlug.trim();
+}
+
+
 interface LobbyProps {
   initialRoomSlug?: string;
   onJoinRoom: (name: string, roomSlug: string, role: string) => void;

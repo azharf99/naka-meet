@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/controls.tsx","./src/components/lobby.test.ts","./src/components/lobby.tsx","./src/components/videogrid.tsx","./src/services/auth.test.ts","./src/services/auth.ts","./src/services/webrtc.test.ts","./src/services/webrtc.ts"],"version":"5.7.3"}

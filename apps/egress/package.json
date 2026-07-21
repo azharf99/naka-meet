@@ -1,0 +1,17 @@
+{
+  "name": "naka-meet-egress",
+  "version": "1.0.0",
+  "description": "Headless Puppeteer & FFmpeg worker for Naka Meet Egress",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "test": "node --test worker.test.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.5.0",
+    "puppeteer": "^24.2.1"
+  },
+  "devDependencies": {
+    "ioredis-mock": "^8.9.0"
+  }
+}

@@ -1,0 +1,87 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: naka-postgres
+    env_file:
+      - .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - naka_network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U nakameet -d nakameet" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: naka-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - naka_network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  sfu-backend:
+    build:
+      context: ./apps/sfu
+      dockerfile: Dockerfile
+    container_name: naka-sfu
+    ports:
+      - "8080:8080"
+      - "50000-50050:50000-50050/udp"
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - naka_network
+
+  frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile
+    container_name: naka-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - sfu-backend
+    networks:
+      - naka_network
+
+  egress-worker:
+    build:
+      context: ./apps/egress
+      dockerfile: Dockerfile
+    container_name: naka-egress
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    networks:
+      - naka_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1G
+
+networks:
+  naka_network:
+    driver: bridge
+
+volumes:
+  pgdata:

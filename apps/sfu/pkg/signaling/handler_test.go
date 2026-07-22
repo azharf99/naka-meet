@@ -243,6 +243,95 @@ func TestSignaling_RenegotiationOfferOnNewTrack(t *testing.T) {
 	assert.NotEmpty(t, msgB.SDP)
 }
 
+func TestSignaling_PreExistingTracksOfferAndMetadataOnJoin(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	// Connect User A and add a pre-existing track
+	userA, _ := uuid.NewV7()
+	tokenA, _ := auth.GenerateTokenWithName(userA.String(), "Host Alice", "host", secret, 1*time.Hour)
+	wsURLA := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=pre-room&token=" + tokenA
+	wsA, _, err := websocket.DefaultDialer.Dial(wsURLA, nil)
+	require.NoError(t, err)
+	defer wsA.Close()
+
+	mockTrack, err := pion.NewTrackLocalStaticSample(
+		pion.RTPCodecCapability{MimeType: pion.MimeTypeVP8},
+		"video-pre",
+		"stream-pre",
+	)
+	require.NoError(t, err)
+	handler.AddTrackAndRenegotiateWithMetadata("pre-room", userA.String(), "Host Alice", "camera", mockTrack)
+
+	// Now User B joins and sends initial SDP offer
+	userB, _ := uuid.NewV7()
+	tokenB, _ := auth.GenerateTokenWithName(userB.String(), "Guest Bob", "participant", secret, 1*time.Hour)
+	wsURLB := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=pre-room&token=" + tokenB
+	wsB, _, err := websocket.DefaultDialer.Dial(wsURLB, nil)
+	require.NoError(t, err)
+	defer wsB.Close()
+
+	clientAPI := pion.NewAPI()
+	clientPC, err := clientAPI.NewPeerConnection(pion.Configuration{})
+	require.NoError(t, err)
+	defer clientPC.Close()
+	_, err = clientPC.AddTransceiverFromKind(pion.RTPCodecTypeAudio)
+	require.NoError(t, err)
+
+	offer, err := clientPC.CreateOffer(nil)
+	require.NoError(t, err)
+	require.NoError(t, clientPC.SetLocalDescription(offer))
+
+	require.NoError(t, wsB.WriteJSON(map[string]string{
+		"type": "offer",
+		"sdp":  offer.SDP,
+	}))
+
+	// User B should first receive the initial answer
+	var ansMsg struct {
+		Type string `json:"type"`
+		SDP  string `json:"sdp"`
+	}
+	require.NoError(t, wsB.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, wsB.ReadJSON(&ansMsg))
+	assert.Equal(t, "answer", ansMsg.Type)
+
+	// Then User B should receive track_metadata for Alice's pre-existing track AND an SDP offer
+	var receivedOffer bool
+	var receivedMetadata bool
+
+	for i := 0; i < 3; i++ {
+		var msg struct {
+			Type     string `json:"type"`
+			SDP      string `json:"sdp"`
+			StreamID string `json:"stream_id"`
+			PeerName string `json:"peer_name"`
+			Kind     string `json:"kind"`
+		}
+		if err := wsB.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			break
+		}
+		if err := wsB.ReadJSON(&msg); err == nil {
+			if msg.Type == "offer" && msg.SDP != "" {
+				receivedOffer = true
+			} else if msg.Type == "track_metadata" && msg.StreamID == "stream-pre" {
+				receivedMetadata = true
+				assert.Equal(t, "Host Alice", msg.PeerName)
+				assert.Equal(t, "camera", msg.Kind)
+			}
+		}
+	}
+
+	assert.True(t, receivedOffer, "User B should receive renegotiation offer containing pre-existing room tracks after initial answer")
+	assert.True(t, receivedMetadata, "User B should receive track_metadata with display name for pre-existing tracks")
+}
+
+
 
 
 

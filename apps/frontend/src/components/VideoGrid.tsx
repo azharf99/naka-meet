@@ -30,7 +30,10 @@ export function deduplicateTracks(remoteTracks: ParticipantTrack[]): Participant
   const map = new Map<string, ParticipantTrack>();
   for (const track of remoteTracks) {
     const key = track.stream?.id || track.peerID || track.id;
-    if (!map.has(key) || track.isScreenShare) {
+    const existing = map.get(key);
+    const hasVideo = track.stream && typeof track.stream.getVideoTracks === 'function' && track.stream.getVideoTracks().length > 0;
+    const existingNoVideo = existing && existing.stream && typeof existing.stream.getVideoTracks === 'function' && existing.stream.getVideoTracks().length === 0;
+    if (!existing || track.isScreenShare || (hasVideo && existingNoVideo)) {
       map.set(key, track);
     }
   }
@@ -71,13 +74,28 @@ const VideoTile: React.FC<{
 
     checkTracks();
 
-    if (videoRef.current && stream && videoRef.current.srcObject !== stream) {
+    if (videoRef.current && videoRef.current.srcObject !== stream) {
       videoRef.current.srcObject = stream;
     }
 
+    const handleTrackEvent = () => {
+      checkTracks();
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+        videoRef.current.srcObject = stream;
+      }
+    };
+
+    stream.addEventListener('addtrack', handleTrackEvent);
+    stream.addEventListener('removetrack', handleTrackEvent);
+
     const interval = setInterval(checkTracks, 1000);
-    return () => clearInterval(interval);
-  }, [stream, hasVideo]);
+    return () => {
+      clearInterval(interval);
+      stream.removeEventListener('addtrack', handleTrackEvent);
+      stream.removeEventListener('removetrack', handleTrackEvent);
+    };
+  }, [stream]);
 
   const initials = getInitials(label);
   const showVideoFallback = !isScreen && (!stream || !hasVideo);

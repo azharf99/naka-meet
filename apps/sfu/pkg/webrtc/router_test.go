@@ -82,8 +82,42 @@ func TestSFURouter_RoomTracksAutoSubscribe(t *testing.T) {
 	_, err = router.AddPeer(subID)
 	require.NoError(t, err)
 
-	count, err := router.SubscribePeerToRoomTracks(roomSlug, subID)
+	count, err := router.SubscribePeerToRoomTracks(roomSlug, subID, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count, "New subscriber should be subscribed to 1 active room track")
 }
+
+func TestSFURouter_RoomTracksSkipOwnTracksAndCleanup(t *testing.T) {
+	router, err := webrtc.NewSFURouter(50000, 50050)
+	require.NoError(t, err)
+
+	roomSlug := "cleanup-room"
+	pubID := "publisher-self"
+
+	_, err = router.AddPeer(pubID)
+	require.NoError(t, err)
+
+	mockTrack, err := pion.NewTrackLocalStaticSample(
+		pion.RTPCodecCapability{MimeType: pion.MimeTypeVP8},
+		"video-self",
+		"stream-self",
+	)
+	require.NoError(t, err)
+
+	// Add track with metadata
+	router.AddTrackToRoomWithMetadata(roomSlug, pubID, "Publisher Self", "camera", mockTrack)
+
+	// Subscribing publisher to own room tracks should yield 0 tracks added
+	count, err := router.SubscribePeerToRoomTracks(roomSlug, pubID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "Publisher should not subscribe to their own tracks")
+
+	// Remove peer should clean up roomTracks
+	err = router.RemovePeer(pubID)
+	require.NoError(t, err)
+
+	tracks := router.GetRoomTracks(roomSlug)
+	assert.Len(t, tracks, 0, "Room tracks published by removed peer should be cleaned up")
+}
+
 

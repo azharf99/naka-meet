@@ -23,12 +23,29 @@ type SignalMessage struct {
 	Kind      string          `json:"kind,omitempty"`
 }
 
+type SafeConn struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (sc *SafeConn) WriteMessage(messageType int, data []byte) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.conn.WriteMessage(messageType, data)
+}
+
+func (sc *SafeConn) Close() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.conn.Close()
+}
+
 type Handler struct {
 	rm        *room.RoomManager
 	router    *webrtc.SFURouter
 	jwtSecret []byte
 	upgrader  websocket.Upgrader
-	conns     map[string]map[string]*websocket.Conn
+	conns     map[string]map[string]*SafeConn
 	mu        sync.RWMutex
 }
 
@@ -42,15 +59,15 @@ func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte
 				return true
 			},
 		},
-		conns: make(map[string]map[string]*websocket.Conn),
+		conns: make(map[string]map[string]*SafeConn),
 	}
 }
 
-func (h *Handler) registerConn(roomSlug, userID string, conn *websocket.Conn) {
+func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, exists := h.conns[roomSlug]; !exists {
-		h.conns[roomSlug] = make(map[string]*websocket.Conn)
+		h.conns[roomSlug] = make(map[string]*SafeConn)
 	}
 	h.conns[roomSlug][userID] = conn
 }
@@ -79,7 +96,11 @@ func (h *Handler) broadcastToRoom(roomSlug, senderID string, message []byte) {
 }
 
 func (h *Handler) AddTrackAndRenegotiate(roomSlug, publisherID string, track pion.TrackLocal) {
-	h.router.BroadcastTrackAndRenegotiate(roomSlug, publisherID, track, func(targetUserID, offerSDP string) {
+	h.AddTrackAndRenegotiateWithMetadata(roomSlug, publisherID, "", "camera", track)
+}
+
+func (h *Handler) AddTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publisherName, kind string, track pion.TrackLocal) {
+	h.router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publisherName, kind, track, func(targetUserID, offerSDP string) {
 		h.mu.RLock()
 		defer h.mu.RUnlock()
 		if roomConns, exists := h.conns[roomSlug]; exists {
@@ -140,7 +161,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to upgrade WebSocket: %v", err)
 		return
 	}
-	defer conn.Close()
+	safeConn := &SafeConn{conn: conn}
+	defer safeConn.Close()
 
 	// 3. Add to Room Manager
 	displayName := claims.Name
@@ -166,8 +188,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to create PeerConnection: %v", err)
 		return
 	}
+	h.router.SetPeerRoom(claims.UserID, roomSlug)
 
-	h.registerConn(roomSlug, claims.UserID, conn)
+	h.registerConn(roomSlug, claims.UserID, safeConn)
 	defer h.unregisterConn(roomSlug, claims.UserID)
 
 	// Attach ICE Candidate Listener on backend PeerConnection
@@ -180,7 +203,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"type":      "candidate",
 			"candidate": candJSON,
 		})
-		_ = conn.WriteMessage(websocket.TextMessage, msgBytes)
+		_ = safeConn.WriteMessage(websocket.TextMessage, msgBytes)
 	})
 
 	// Attach OnTrack Listener on backend PeerConnection for RTP track forwarding
@@ -189,6 +212,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("Failed to create local track: %v", err)
 			return
+		}
+
+		kind := "camera"
+		if strings.Contains(strings.ToLower(remoteTrack.StreamID()), "screen") || strings.Contains(strings.ToLower(remoteTrack.ID()), "screen") {
+			kind = "screen"
 		}
 
 		// Forward RTP Packets in Goroutine
@@ -205,8 +233,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}(remoteTrack, localTrack)
 
+		// Broadcast track metadata to all existing participants right when track is published
+		metaBytes, _ := json.Marshal(map[string]interface{}{
+			"type":      "track_metadata",
+			"stream_id": localTrack.StreamID(),
+			"track_id":  localTrack.ID(),
+			"peer_id":   claims.UserID,
+			"peer_name": displayName,
+			"kind":      kind,
+		})
+		h.broadcastToRoom(roomSlug, claims.UserID, metaBytes)
+
 		// Broadcast track to all other room participants & trigger SDP renegotiation
-		h.AddTrackAndRenegotiate(roomSlug, claims.UserID, localTrack)
+		h.AddTrackAndRenegotiateWithMetadata(roomSlug, claims.UserID, displayName, kind, localTrack)
 	})
 
 	// 5. Message Loop
@@ -229,9 +268,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					SDP:  msg.SDP,
 				}
 				if err := pc.SetRemoteDescription(offer); err == nil {
-					// Subscribe peer to any pre-existing active room tracks
-					_, _ = h.router.SubscribePeerToRoomTracks(roomSlug, claims.UserID)
-
 					answer, err := pc.CreateAnswer(nil)
 					if err == nil {
 						if err := pc.SetLocalDescription(answer); err == nil {
@@ -239,7 +275,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 								"type": "answer",
 								"sdp":  answer.SDP,
 							})
-							_ = conn.WriteMessage(websocket.TextMessage, ansBytes)
+							_ = safeConn.WriteMessage(websocket.TextMessage, ansBytes)
+
+							// Subscribe peer to any pre-existing active room tracks AFTER initial answer is sent
+							count, _ := h.router.SubscribePeerToRoomTracks(roomSlug, claims.UserID, func(rt *webrtc.RoomTrack) {
+								metaBytes, _ := json.Marshal(map[string]interface{}{
+									"type":      "track_metadata",
+									"stream_id": rt.Track.StreamID(),
+									"track_id":  rt.Track.ID(),
+									"peer_id":   rt.PublisherID,
+									"peer_name": rt.PublisherName,
+									"kind":      rt.Kind,
+								})
+								_ = safeConn.WriteMessage(websocket.TextMessage, metaBytes)
+							})
+
+							if count > 0 && pc.SignalingState() == pion.SignalingStateStable {
+								renegOffer, err := pc.CreateOffer(nil)
+								if err == nil {
+									if err := pc.SetLocalDescription(renegOffer); err == nil {
+										offerBytes, _ := json.Marshal(map[string]interface{}{
+											"type": "offer",
+											"sdp":  renegOffer.SDP,
+										})
+										_ = safeConn.WriteMessage(websocket.TextMessage, offerBytes)
+									}
+								}
+							}
 						}
 					}
 				}
@@ -261,8 +323,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case "track_metadata":
-			// BR4 Out-of-band labeling: broadcast metadata to all participants in room
-			h.broadcastToRoom(roomSlug, claims.UserID, messageBytes)
+			var rawMap map[string]interface{}
+			if err := json.Unmarshal(messageBytes, &rawMap); err == nil {
+				rawMap["peer_id"] = claims.UserID
+				rawMap["peer_name"] = displayName
+				enriched, _ := json.Marshal(rawMap)
+				h.broadcastToRoom(roomSlug, claims.UserID, enriched)
+			} else {
+				h.broadcastToRoom(roomSlug, claims.UserID, messageBytes)
+			}
 		}
 	}
 }
+

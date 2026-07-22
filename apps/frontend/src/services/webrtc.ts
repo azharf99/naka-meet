@@ -15,6 +15,10 @@ export class WebRTCService {
   private localStream: MediaStream | null = null;
   private screenStream: MediaStream | null = null;
 
+  private makingOffer = false;
+  private trackMetadataMap = new Map<string, { streamId: string; peerId: string; peerName: string; kind: string }>();
+  private remoteStreams = new Map<string, MediaStream>();
+
   public onTrackAdded?: TrackCallback;
   public onTrackRemoved?: (trackId: string) => void;
   public onScreenShareEnded?: () => void;
@@ -55,22 +59,33 @@ export class WebRTCService {
     this.pc.onnegotiationneeded = async () => {
       try {
         if (this.pc && this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.makingOffer = true;
           const offer = await this.pc.createOffer();
+          if (this.pc.signalingState !== 'stable') return;
           await this.pc.setLocalDescription(offer);
           this.ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
         }
       } catch (err) {
         console.error('Error during renegotiation', err);
+      } finally {
+        this.makingOffer = false;
       }
     };
 
     // Add local tracks to PeerConnection
-    if (this.localStream) {
+    if (this.localStream && this.localStream.getTracks().length > 0) {
       this.localStream.getTracks().forEach((track) => {
         if (this.pc && this.localStream) {
           this.pc.addTrack(track, this.localStream);
         }
       });
+    } else if (this.pc && typeof this.pc.addTransceiver === 'function') {
+      try {
+        this.pc.addTransceiver('video', { direction: 'recvonly' });
+        this.pc.addTransceiver('audio', { direction: 'recvonly' });
+      } catch (e) {
+        console.warn('Could not add recvonly transceivers', e);
+      }
     }
 
     // Offerer side DataChannel for Chat & File Transfer
@@ -83,25 +98,52 @@ export class WebRTCService {
     };
 
     const streamMetadataMap = new Map<string, string>();
-
+    const peerNameMap = new Map<string, string>();
 
     // Handle Remote Track
     this.pc.ontrack = (event) => {
-      const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+      const trackId = event.track.id;
+      const metadata = this.trackMetadataMap.get(trackId);
+      const streamId = metadata?.streamId || (event.streams && event.streams[0]?.id) || `stream-${trackId}`;
+      const peerName = metadata?.peerName || peerNameMap.get(streamId) || streamId;
+      const kind = metadata?.kind || streamMetadataMap.get(streamId) || 'camera';
+      const isScreen =
+        kind === 'screen' ||
+        streamId.includes('screen') ||
+        event.track.label.toLowerCase().includes('screen');
+
+      let stream = this.remoteStreams.get(streamId);
+      if (!stream) {
+        if (event.streams && event.streams[0]) {
+          stream = event.streams[0];
+        } else {
+          stream = new MediaStream();
+          try {
+            Object.defineProperty(stream, 'id', { value: streamId, configurable: true, enumerable: true });
+          } catch (e) {
+            console.warn('Failed to override MediaStream id', e);
+          }
+        }
+        this.remoteStreams.set(streamId, stream);
+      }
+      
+      if (stream && typeof stream.getTracks === 'function') {
+        if (!stream.getTracks().find((t) => t.id === trackId)) {
+          if (typeof stream.addTrack === 'function') {
+            stream.addTrack(event.track);
+          }
+        }
+      }
+
       if (this.onTrackAdded) {
-        const isScreen =
-          stream.id.includes('screen') ||
-          event.track.label.toLowerCase().includes('screen') ||
-          streamMetadataMap.get(stream.id) === 'screen';
         this.onTrackAdded({
-          id: event.track.id,
-          peerID: stream.id || 'remote-peer',
+          id: trackId,
+          peerID: peerName,
           stream: stream,
           isScreenShare: isScreen,
         });
       }
     };
-
 
     // Setup WebSocket Signaling
     const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
@@ -111,30 +153,67 @@ export class WebRTCService {
 
     this.ws = new WebSocket(wsURL);
 
+    this.ws.onopen = async () => {
+      try {
+        if (this.pc && this.ws && (this.ws.readyState === 1 || this.ws.readyState === WebSocket.OPEN)) {
+          if (this.pc.signalingState === 'stable') {
+            this.makingOffer = true;
+            const offer = await this.pc.createOffer();
+            await this.pc.setLocalDescription(offer);
+            this.ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+          }
+        }
+      } catch (err) {
+        console.error('Error sending initial SDP offer on WS open:', err);
+      } finally {
+        this.makingOffer = false;
+      }
+    };
+
     this.ws.onmessage = async (event) => {
       const msg = JSON.parse(event.data);
       if (msg.type === 'offer' && this.pc) {
-        await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: msg.sdp }));
-        const answer = await this.pc.createAnswer();
-        await this.pc.setLocalDescription(answer);
-        this.ws?.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        try {
+          const readyStateStable = this.pc.signalingState === 'stable';
+          const offerCollision = this.makingOffer || !readyStateStable;
+          if (offerCollision) {
+            await this.pc.setLocalDescription({ type: 'rollback' });
+          }
+          await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: msg.sdp }));
+          const answer = await this.pc.createAnswer();
+          await this.pc.setLocalDescription(answer);
+          this.ws?.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        } catch (err) {
+          console.error('Error handling remote offer:', err);
+        }
       } else if (msg.type === 'answer' && this.pc) {
-        await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
+        try {
+          await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
+        } catch (err) {
+          console.error('Error handling remote answer:', err);
+        }
       } else if (msg.type === 'candidate' && this.pc) {
-        await this.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        try {
+          await this.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } catch (err) {
+          console.error('Error adding remote ICE candidate:', err);
+        }
       } else if (msg.type === 'track_metadata') {
-        // BR4: Handle out-of-band screen track metadata from Pion SFU
         if (msg.stream_id && msg.kind) {
           streamMetadataMap.set(msg.stream_id, msg.kind);
         }
-        if (msg.kind === 'screen' && msg.stream_id && this.onTrackAdded) {
-          this.onTrackAdded({
-            id: msg.stream_id,
-            peerID: msg.peer_id || 'remote-presenter',
-            stream: new MediaStream(),
-            isScreenShare: true,
+        if (msg.stream_id && (msg.peer_name || msg.peer_id)) {
+          peerNameMap.set(msg.stream_id, msg.peer_name || msg.peer_id);
+        }
+        if (msg.track_id && msg.stream_id) {
+          this.trackMetadataMap.set(msg.track_id, {
+            streamId: msg.stream_id,
+            peerId: msg.peer_id || '',
+            peerName: msg.peer_name || msg.peer_id || '',
+            kind: msg.kind || 'camera',
           });
-        } else if (msg.kind === 'screen_stopped' && msg.stream_id && this.onTrackRemoved) {
+        }
+        if (msg.kind === 'screen_stopped' && msg.stream_id && this.onTrackRemoved) {
           this.onTrackRemoved(msg.stream_id);
         }
       }

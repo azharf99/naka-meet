@@ -18,13 +18,18 @@
   - **Persistent Recordings Storage:** Direct host bind mount `./recordings:/usr/src/app/recordings` pada `docker-compose.yml`, pembuatan folder `RUN mkdir -p recordings` di `Dockerfile`, serta pengaitan `RECORDINGS_DIR=/usr/src/app/recordings` di Egress Worker sehingga file rekaman MP4 tersimpan secara langsung ke direktori lokal host (`./recordings`).
 
   - **Pemisahan Record Room & Live Stream RTMP:** Tombol khusus "Record" (rekaman lokal) & "Go Live" (RTMP YouTube) dengan Modal Setup RTMP Ingestion URL.
-  - **Audit 3 Titik Kritis WebRTC Multi-User (100% Verifikasi Lulus):**
-    1. **Backend Fan-Out Routing:** Direct RTP packet forwarding dari `TrackRemote` publisher ke `TrackLocalStaticRTP` subscriber untuk semua peserta di room (`BroadcastTrackAndRenegotiate`).
-    2. **SDP Renegotiation Auto-Trigger:** Penyiaran sinyal SDP Offer otomatis via WebSocket setiap kali ada track baru ditambahkan (`pc.AddTrack`) agar browser partisipan memperbarui koneksi WebRTC secara real-time.
-    3. **Frontend `ontrack` Catch & MediaStream Fallback:** Pemastian event `pc.ontrack` di React selalu membuat `MediaStream` fallback jika `event.streams` kosong dan menempelkannya secara otomatis ke elemen UI `<video>`.
+  - **Audit & Solusi Akar Masalah WebRTC Multi-User & Concurrency (100% Verifikasi Lulus & Deployed):**
+    1. **Structured RoomTrack & Metadata Persistence:** Refactor `SFURouter` (`RoomTrack`) untuk menyimpan `PublisherID`, `PublisherName`, dan `Kind` (`camera` vs `screen`) disertai proteksi filter agar publisher tidak berlangganan ke track miliknya sendiri (*self-track skipping*).
+    2. **Pre-existing Tracks Renegotiation on Join:** Setelah partisipan baru menyelesaikan *SDP Offer/Answer* awal, server (`handler.go`) otomatis melanggan partisipan ke seluruh track aktif di ruangan, mengirim `track_metadata`, dan memicu renegosiasi SDP Offer baru agar video peserta sebelumnya langsung tampil di layar peserta baru.
+    3. **SafeConn Thread-Safe WebSocket Routing:** Implementasi `SafeConn` dengan `sync.Mutex` untuk mencegah *gorilla/websocket concurrent write panic* dari *goroutine* (`OnICECandidate`, `OnTrack`, dan siklus renegosiasi).
+    4. **Frontend Display Name & Video Deduplication:** Pemetaan `peerNameMap` & `streamMetadataMap` di `webrtc.ts` serta pembaruan logika `deduplicateTracks` di `VideoGrid.tsx` agar video aktif menggantikan entri audio-only tanpa menghasilkan kotak hitam/empty `MediaStream`.
 
 ## Log Aktivitas Terakhir
-- **2026-07-22:** Audit 3 titik kritis WebRTC Multi-User (Backend Fan-Out Routing, SDP Renegotiation Auto-Trigger via WebSocket saat track ditambahkan, dan Frontend `ontrack` MediaStream Fallback). Memastikan seluruh partisipan yang bergabung dapat saling melihat video/audio sesama peserta, Host, dan Screen Share secara real-time (100% TDD Lulus).
+- **2026-07-22:** Penyelesaian perbaikan arsitektur SFU dan sinkronisasi WebRTC Multi-User (*Pre-existing Tracks Renegotiation*, *RoomTrack Metadata Persistence*, *SafeConn Thread-Safety*, dan *Frontend Display Name Mapping*). Seluruh unit test Go & React lulus 100% dan kontainer Docker (`naka-sfu`, `naka-frontend`) telah diperbarui dan berjalan stabil.
+- **2026-07-22 (Fix Multi-Room Fan-Out & Renegotiation Glare):**
+  - **Backend Room-Scoped Fan-Out**: Membatasi fan-out track RTP dan distribusi SDP Offer hanya untuk peer di room yang sama melalui pemetaan `peerRooms` di `SFURouter`, menyelesaikan isu "inbound-rtp" hilang akibat kerusakan state negosiasi lintas room.
+  - **Frontend Polite Renegotiation**: Menerapkan pattern perfect negotiation (polite rollback) di `WebRTCService` untuk menangani tabrakan SDP offer (glare) saat in-meeting.
+  - **Dynamic Track Rendering**: Menambahkan event listener `addtrack` dan `removetrack` pada `MediaStream` di `VideoTile` untuk memaksa re-binding `srcObject` saat track baru ditambahkan dinamis.
 
 
 

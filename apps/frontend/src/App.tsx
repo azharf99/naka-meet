@@ -98,8 +98,15 @@ export const App: React.FC = () => {
           setRemoteTracks((prev) => [...prev.filter((t) => t.id !== track.id), track]);
         };
 
-        service.onTrackRemoved = (trackId) => {
-          setRemoteTracks((prev) => prev.filter((t) => t.id !== trackId && t.stream?.id !== trackId));
+        service.onTrackRemoved = (idOrPeerId) => {
+          setRemoteTracks((prev) =>
+            prev.filter(
+              (t) =>
+                t.id !== idOrPeerId &&
+                t.peerID !== idOrPeerId &&
+                t.stream?.id !== idOrPeerId
+            )
+          );
         };
 
         service.onScreenShareEnded = () => {

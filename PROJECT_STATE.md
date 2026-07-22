@@ -27,9 +27,14 @@
 ## Log Aktivitas Terakhir
 - **2026-07-22:** Penyelesaian perbaikan arsitektur SFU dan sinkronisasi WebRTC Multi-User (*Pre-existing Tracks Renegotiation*, *RoomTrack Metadata Persistence*, *SafeConn Thread-Safety*, dan *Frontend Display Name Mapping*). Seluruh unit test Go & React lulus 100% dan kontainer Docker (`naka-sfu`, `naka-frontend`) telah diperbarui dan berjalan stabil.
 - **2026-07-22 (Fix Multi-Room Fan-Out & Renegotiation Glare):**
-  - **Backend Room-Scoped Fan-Out**: Membatasi fan-out track RTP dan distribusi SDP Offer hanya untuk peer di room yang sama melalui pemetaan `peerRooms` di `SFURouter`, menyelesaikan isu "inbound-rtp" hilang akibat kerusakan state negosiasi lintas room.
+  - **Backend Room-Scoped Fan-Out**: Membatasi fan-out track RTP dan distribusi SDP Offer hanya untuk peer di room yang sama melalui pemetaan `peerRooms` di `SFURouter`, menyelesaikan isu "inbound-rtp" hilang akibat kerusakan state negosiation lintas room.
   - **Frontend Polite Renegotiation**: Menerapkan pattern perfect negotiation (polite rollback) di `WebRTCService` untuk menangani tabrakan SDP offer (glare) saat in-meeting.
   - **Dynamic Track Rendering**: Menambahkan event listener `addtrack` dan `removetrack` pada `MediaStream` di `VideoTile` untuk memaksa re-binding `srcObject` saat track baru ditambahkan dinamis.
+- **2026-07-22 (Fix Guest Negotiation Queue, Device-in-Use Fallback & Participant Disconnect Purge):**
+  - **Guest Signal Queue (`messageQueue`)**: Menerapkan antrean pesan sinkronis (`messageQueue` Promise chain) pada `WebRTCService` untuk memproses sinyal WebSocket SDP secara berurutan, menghilangkan kondisi *race condition* saat `answer` dan `renegOffer` tiba bersamaan saat Guest masuk.
+  - **Recvonly Fallback Transceivers & WS Open Offer Trigger**: Memastikan penanganan `recvonly` transceivers dan pemicu offer awal pada `this.ws.onopen` berjalan sempurna saat media device (*camera/mic*) tidak aktif atau sedang digunakan aplikasi lain.
+  - **Pembersihan Grid Partisipan (Leave Cleanup & Anti-Memory Leak)**: Menambahkan `RemovePeer` dan siaran WebSocket `participant_left` di handler SFU Go (`handler.go`) saat partisipan terputus/tutup tab, serta pemetaan `peerIdentifiersMap` di `webrtc.ts` & `App.tsx` yang secara instan menghapus tile partisipan yang keluar dari Video Grid.
+  - **End-to-End Verifikasi Puppeteer Browser**: Pengujian otomatis 2 partisipan (Host Alice & Guest Bob) mengonfirmasi bahwa Host dan Guest **langsung saling terlihat** di layar masing-masing (2 tile), dan tile Guest Bob **langsung terhapus dari grid Host Alice** saat Guest Bob keluar (kembali menjadi 1 tile), 100% lulus tanpa memory leak.
 
 
 

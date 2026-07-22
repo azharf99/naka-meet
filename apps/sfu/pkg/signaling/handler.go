@@ -191,7 +191,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.router.SetPeerRoom(claims.UserID, roomSlug)
 
 	h.registerConn(roomSlug, claims.UserID, safeConn)
-	defer h.unregisterConn(roomSlug, claims.UserID)
+	defer func() {
+		h.unregisterConn(roomSlug, claims.UserID)
+		_ = h.router.RemovePeer(claims.UserID)
+		leftMsg, _ := json.Marshal(map[string]interface{}{
+			"type":    "participant_left",
+			"peer_id": claims.UserID,
+		})
+		h.broadcastToRoom(roomSlug, claims.UserID, leftMsg)
+	}()
 
 	// Attach ICE Candidate Listener on backend PeerConnection
 	pc.OnICECandidate(func(c *pion.ICECandidate) {

@@ -331,6 +331,45 @@ func TestSignaling_PreExistingTracksOfferAndMetadataOnJoin(t *testing.T) {
 	assert.True(t, receivedMetadata, "User B should receive track_metadata with display name for pre-existing tracks")
 }
 
+func TestSignaling_ParticipantLeftBroadcastOnDisconnect(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	// Connect User A (Host)
+	userA, _ := uuid.NewV7()
+	tokenA, _ := auth.GenerateTokenWithName(userA.String(), "UserA", "host", secret, 1*time.Hour)
+	wsURLA := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=disconnect-room&token=" + tokenA
+	wsA, _, err := websocket.DefaultDialer.Dial(wsURLA, nil)
+	require.NoError(t, err)
+	defer wsA.Close()
+
+	// Connect User B (Guest)
+	userB, _ := uuid.NewV7()
+	tokenB, _ := auth.GenerateTokenWithName(userB.String(), "UserB", "participant", secret, 1*time.Hour)
+	wsURLB := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=disconnect-room&token=" + tokenB
+	wsB, _, err := websocket.DefaultDialer.Dial(wsURLB, nil)
+	require.NoError(t, err)
+
+	// User B disconnects (closes WS connection)
+	_ = wsB.Close()
+
+	// User A should receive a participant_left message for User B
+	var msgA struct {
+		Type   string `json:"type"`
+		PeerID string `json:"peer_id"`
+	}
+	require.NoError(t, wsA.SetReadDeadline(time.Now().Add(2*time.Second)))
+	err = wsA.ReadJSON(&msgA)
+	require.NoError(t, err, "User A should receive participant_left notification when User B disconnects")
+	assert.Equal(t, "participant_left", msgA.Type)
+	assert.Equal(t, userB.String(), msgA.PeerID)
+}
+
 
 
 

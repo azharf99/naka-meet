@@ -18,8 +18,8 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.26'
-    - name: Run Tests
-      run: go test -v ./...
+    - name: Run Unit Tests SFU
+      run: cd apps/sfu && go test -v ./...
 
   build-and-deploy:
     name: Build Image and Deploy to VPS

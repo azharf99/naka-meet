@@ -11,7 +11,6 @@ export type MessageCallback = (msg: { sender: string; text: string; time: string
 export class WebRTCService {
   private pc: RTCPeerConnection | null = null;
   private ws: WebSocket | null = null;
-  private dataChannel: RTCDataChannel | null = null;
   private localStream: MediaStream | null = null;
   private screenStream: MediaStream | null = null;
 
@@ -99,15 +98,6 @@ export class WebRTCService {
         console.warn('Could not add recvonly transceivers', e);
       }
     }
-
-    // Offerer side DataChannel for Chat & File Transfer
-    this.dataChannel = this.pc.createDataChannel('chat-and-files');
-    this.setupDataChannelEvents(this.dataChannel);
-
-    // Answerer side DataChannel listener
-    this.pc.ondatachannel = (event) => {
-      this.setupDataChannelEvents(event.channel);
-    };
 
     const streamMetadataMap = new Map<string, string>();
     const peerNameMap = new Map<string, string>();
@@ -220,6 +210,17 @@ export class WebRTCService {
         return;
       }
 
+      if (msg.type === 'chat') {
+        if (this.onMessageReceived) {
+          this.onMessageReceived({
+            sender: msg.sender || 'Guest',
+            text: msg.text || '',
+            time: msg.time || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          });
+        }
+        return;
+      }
+
       if (msg.type === 'participant_left' && msg.peer_id) {
         const identifiers = this.peerIdentifiersMap.get(msg.peer_id);
         if (this.onTrackRemoved) {
@@ -269,19 +270,6 @@ export class WebRTCService {
         .catch((err) => {
           console.error('Error processing SDP message:', err);
         }));
-    };
-  }
-
-  private setupDataChannelEvents(dc: RTCDataChannel) {
-    dc.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (this.onMessageReceived) {
-          this.onMessageReceived(data);
-        }
-      } catch (err) {
-        console.error('Failed to parse DataChannel message', err);
-      }
     };
   }
 
@@ -343,17 +331,22 @@ export class WebRTCService {
 
 
 
+  // Chat is relayed by the SFU over the signaling WebSocket, not a
+  // browser-to-browser RTCDataChannel: every client only ever has a
+  // PeerConnection to the SFU (hub-and-spoke), never to other participants,
+  // so a DataChannel message would have nowhere to go without server relay.
   public sendMessage(text: string): void {
-    if (this.dataChannel && this.dataChannel.readyState === 'open') {
-      const payload = {
+    const trimmed = text.trim();
+    if (!trimmed || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    this.ws.send(JSON.stringify({ type: 'chat', text: trimmed }));
+
+    if (this.onMessageReceived) {
+      this.onMessageReceived({
         sender: 'You',
-        text: text,
+        text: trimmed,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      };
-      this.dataChannel.send(JSON.stringify(payload));
-      if (this.onMessageReceived) {
-        this.onMessageReceived(payload);
-      }
+      });
     }
   }
 

@@ -1,6 +1,7 @@
 package webrtc_test
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/naka-meet/sfu/pkg/webrtc"
@@ -118,6 +119,73 @@ func TestSFURouter_RoomTracksSkipOwnTracksAndCleanup(t *testing.T) {
 
 	tracks := router.GetRoomTracks(roomSlug)
 	assert.Len(t, tracks, 0, "Room tracks published by removed peer should be cleaned up")
+}
+
+// TestSFURouter_ConcurrentTrackPublishDoesNotDropRenegotiation reproduces the
+// "host/participants can't see all videos" bug: a publisher's camera and mic
+// tracks (or two publishers joining back-to-back) each trigger their own
+// renegotiation to the same subscriber at nearly the same instant. Without
+// per-peer serialization, the second CreateOffer/SetLocalDescription races
+// the first, silently fails because the PeerConnection isn't stable yet, and
+// is never retried - permanently starving the subscriber of that track.
+func TestSFURouter_ConcurrentTrackPublishDoesNotDropRenegotiation(t *testing.T) {
+	router, err := webrtc.NewSFURouter(50000, 50050)
+	require.NoError(t, err)
+
+	pubID := "publisher-concurrent"
+	subID := "subscriber-concurrent"
+	roomSlug := "concurrent-room"
+
+	_, err = router.AddPeer(pubID)
+	require.NoError(t, err)
+	subPC, err := router.AddPeer(subID)
+	require.NoError(t, err)
+	router.SetPeerRoom(pubID, roomSlug)
+	router.SetPeerRoom(subID, roomSlug)
+
+	// Stands in for the subscriber's real browser: answers whatever offer
+	// the SFU sends, so a blocked renegotiation attempt can proceed as soon
+	// as it acquires its turn instead of waiting out the stable-state timeout.
+	fakeClientPC, err := pion.NewAPI().NewPeerConnection(pion.Configuration{})
+	require.NoError(t, err)
+	defer fakeClientPC.Close()
+
+	var cbMu sync.Mutex
+	offersReceived := 0
+	sendOfferCb := func(peerID, offerSDP string) {
+		cbMu.Lock()
+		defer cbMu.Unlock()
+		offersReceived++
+
+		require.NoError(t, fakeClientPC.SetRemoteDescription(pion.SessionDescription{Type: pion.SDPTypeOffer, SDP: offerSDP}))
+		answer, err := fakeClientPC.CreateAnswer(nil)
+		require.NoError(t, err)
+		require.NoError(t, fakeClientPC.SetLocalDescription(answer))
+		require.NoError(t, subPC.SetRemoteDescription(answer))
+	}
+
+	audioTrack, err := pion.NewTrackLocalStaticSample(pion.RTPCodecCapability{MimeType: pion.MimeTypeOpus}, "audio-1", "stream-concurrent")
+	require.NoError(t, err)
+	videoTrack, err := pion.NewTrackLocalStaticSample(pion.RTPCodecCapability{MimeType: pion.MimeTypeVP8}, "video-1", "stream-concurrent")
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, pubID, "Publisher", "camera", audioTrack, sendOfferCb)
+	}()
+	go func() {
+		defer wg.Done()
+		router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, pubID, "Publisher", "camera", videoTrack, sendOfferCb)
+	}()
+	wg.Wait()
+
+	assert.Len(t, subPC.GetSenders(), 2, "Both concurrently-published tracks should reach the subscriber's PeerConnection")
+
+	cbMu.Lock()
+	defer cbMu.Unlock()
+	assert.Equal(t, 2, offersReceived, "Both concurrent renegotiation attempts should deliver an offer, not silently drop one")
 }
 
 

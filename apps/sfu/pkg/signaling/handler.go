@@ -21,6 +21,7 @@ type SignalMessage struct {
 	Candidate json.RawMessage `json:"candidate,omitempty"`
 	StreamID  string          `json:"stream_id,omitempty"`
 	Kind      string          `json:"kind,omitempty"`
+	Text      string          `json:"text,omitempty"`
 }
 
 type SafeConn struct {
@@ -41,16 +42,17 @@ func (sc *SafeConn) Close() error {
 }
 
 type Handler struct {
-	rm        *room.RoomManager
-	router    *webrtc.SFURouter
-	jwtSecret []byte
-	upgrader  websocket.Upgrader
-	conns     map[string]map[string]*SafeConn
-	mu        sync.RWMutex
+	rm          *room.RoomManager
+	router      *webrtc.SFURouter
+	jwtSecret   []byte
+	upgrader    websocket.Upgrader
+	conns       map[string]map[string]*SafeConn
+	connsByUser map[string]*SafeConn
+	mu          sync.RWMutex
 }
 
 func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte) *Handler {
-	return &Handler{
+	h := &Handler{
 		rm:        rm,
 		router:    router,
 		jwtSecret: jwtSecret,
@@ -59,8 +61,14 @@ func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte
 				return true
 			},
 		},
-		conns: make(map[string]map[string]*SafeConn),
+		conns:       make(map[string]map[string]*SafeConn),
+		connsByUser: make(map[string]*SafeConn),
 	}
+	// Lets the router deliver a renegotiation offer to any peer (e.g. one
+	// that was deferred because the peer's signaling state wasn't stable
+	// when a track was published) without needing to know its room.
+	router.SetOfferSender(h.sendOfferToPeer)
+	return h
 }
 
 func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) {
@@ -70,6 +78,7 @@ func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) {
 		h.conns[roomSlug] = make(map[string]*SafeConn)
 	}
 	h.conns[roomSlug][userID] = conn
+	h.connsByUser[userID] = conn
 }
 
 func (h *Handler) unregisterConn(roomSlug, userID string) {
@@ -81,6 +90,21 @@ func (h *Handler) unregisterConn(roomSlug, userID string) {
 			delete(h.conns, roomSlug)
 		}
 	}
+	delete(h.connsByUser, userID)
+}
+
+func (h *Handler) sendOfferToPeer(peerID, sdp string) {
+	h.mu.RLock()
+	conn, exists := h.connsByUser[peerID]
+	h.mu.RUnlock()
+	if !exists {
+		return
+	}
+	msgBytes, _ := json.Marshal(map[string]interface{}{
+		"type": "offer",
+		"sdp":  sdp,
+	})
+	_ = conn.WriteMessage(websocket.TextMessage, msgBytes)
 }
 
 func (h *Handler) broadcastToRoom(roomSlug, senderID string, message []byte) {
@@ -100,19 +124,7 @@ func (h *Handler) AddTrackAndRenegotiate(roomSlug, publisherID string, track pio
 }
 
 func (h *Handler) AddTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publisherName, kind string, track pion.TrackLocal) {
-	h.router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publisherName, kind, track, func(targetUserID, offerSDP string) {
-		h.mu.RLock()
-		defer h.mu.RUnlock()
-		if roomConns, exists := h.conns[roomSlug]; exists {
-			if c, found := roomConns[targetUserID]; found {
-				msgBytes, _ := json.Marshal(map[string]interface{}{
-					"type": "offer",
-					"sdp":  offerSDP,
-				})
-				_ = c.WriteMessage(websocket.TextMessage, msgBytes)
-			}
-		}
-	})
+	h.router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publisherName, kind, track, h.sendOfferToPeer)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -298,17 +310,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 								_ = safeConn.WriteMessage(websocket.TextMessage, metaBytes)
 							})
 
-							if count > 0 && pc.SignalingState() == pion.SignalingStateStable {
-								renegOffer, err := pc.CreateOffer(nil)
-								if err == nil {
-									if err := pc.SetLocalDescription(renegOffer); err == nil {
-										offerBytes, _ := json.Marshal(map[string]interface{}{
-											"type": "offer",
-											"sdp":  renegOffer.SDP,
-										})
-										_ = safeConn.WriteMessage(websocket.TextMessage, offerBytes)
-									}
-								}
+							// Routed through the router's serialized renegotiation path
+							// (not an inline CreateOffer here) so this doesn't race a
+							// concurrent renegotiation triggered by another publisher's
+							// OnTrack callback firing for this same brand-new peer.
+							if count > 0 {
+								h.router.RenegotiatePeer(claims.UserID)
 							}
 						}
 					}
@@ -340,6 +347,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				h.broadcastToRoom(roomSlug, claims.UserID, messageBytes)
 			}
+
+		case "chat":
+			// Every client only has a PeerConnection to the SFU (hub-and-spoke,
+			// never peer-to-peer), so a browser-side RTCDataChannel message has
+			// no path to other participants unless the server relays it. The
+			// signaling WebSocket's existing room broadcast is that relay.
+			if strings.TrimSpace(msg.Text) == "" {
+				continue
+			}
+			chatBytes, _ := json.Marshal(map[string]interface{}{
+				"type":    "chat",
+				"text":    msg.Text,
+				"sender":  displayName,
+				"peer_id": claims.UserID,
+				"time":    time.Now().Format("15:04"),
+			})
+			h.broadcastToRoom(roomSlug, claims.UserID, chatBytes)
 		}
 	}
 }

@@ -102,7 +102,7 @@ const VideoTile: React.FC<{
   const showMicMuted = isMicMuted || !hasAudio;
 
   return (
-    <div className={`relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center ${isScreen ? 'w-full h-full min-h-[400px]' : 'w-full aspect-video min-h-[200px]'}`}>
+    <div className="relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center w-full h-full">
       <video
         ref={videoRef}
         autoPlay
@@ -159,20 +159,26 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
 
   const localLabel = displayName ? `${displayName} (You)` : `You (${userRole})`;
 
-  // BR4: Stage Mode rendering when screen track or out-of-band metadata screen track is active
+  // BR4: Stage Mode rendering when screen track or out-of-band metadata screen track is active.
+  // Tiles fill their allotted space instead of scrolling: a fixed egress
+  // viewport (Puppeteer recording this page) can never scroll, so anything
+  // that overflowed here would simply be missing from the recording.
   if (activePresentationStream) {
+    const sidebarTracks = uniqueTracks.filter((t) => !t.isScreenShare);
     return (
-      <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 h-[calc(100vh-80px)]">
-        <div className="lg:col-span-3 h-full">
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 h-[calc(100vh-80px)] overflow-hidden">
+        <div className="lg:col-span-3 h-full min-h-0">
           <VideoTile stream={activePresentationStream} label={presentationLabel} isScreen />
         </div>
-        <div className="flex flex-col gap-3 overflow-y-auto pr-1">
-          <VideoTile stream={localStream} label={localLabel} />
-          {uniqueTracks
-            .filter((t) => !t.isScreenShare)
-            .map((track) => (
-              <VideoTile key={track.id} stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />
-            ))}
+        <div className="flex flex-col gap-3 h-full min-h-0 overflow-hidden">
+          <div className="flex-1 min-h-0">
+            <VideoTile stream={localStream} label={localLabel} />
+          </div>
+          {sidebarTracks.map((track) => (
+            <div key={track.id} className="flex-1 min-h-0">
+              <VideoTile stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />
+            </div>
+          ))}
         </div>
       </div>
     );
@@ -182,8 +188,8 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   const gridClass = getGridClass(totalTiles);
 
   return (
-    <div className="flex-1 p-6 overflow-y-auto h-[calc(100vh-80px)] flex items-center justify-center">
-      <div className={`grid ${gridClass} gap-4 w-full justify-center items-center max-w-7xl`}>
+    <div className="flex-1 p-6 h-[calc(100vh-80px)] flex items-center justify-center overflow-hidden">
+      <div className={`grid ${gridClass} auto-rows-fr gap-4 w-full h-full justify-center items-stretch max-w-7xl`}>
         <VideoTile stream={localStream} label={localLabel} />
         {uniqueTracks.map((track) => (
           <VideoTile key={track.id} stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />

@@ -4,15 +4,9 @@ import { WebRTCService } from './webrtc';
 class MockRTCPeerConnection {
   onicecandidate: ((ev: any) => void) | null = null;
   ontrack: ((ev: any) => void) | null = null;
-  ondatachannel: ((ev: any) => void) | null = null;
   onnegotiationneeded: ((ev: any) => void) | null = null;
 
   addTrack = vi.fn();
-  createDataChannel = vi.fn().mockReturnValue({
-    onmessage: null,
-    send: vi.fn(),
-    readyState: 'open',
-  });
   createOffer = vi.fn().mockResolvedValue({ type: 'offer', sdp: 'mock-sdp' });
   setLocalDescription = vi.fn().mockResolvedValue(undefined);
   setRemoteDescription = vi.fn().mockResolvedValue(undefined);
@@ -22,9 +16,11 @@ class MockRTCPeerConnection {
 }
 
 class MockWebSocket {
+  static OPEN = 1;
   onmessage: ((ev: any) => void) | null = null;
   send = vi.fn();
   close = vi.fn();
+  readyState: number = 1; // WebSocket.OPEN
 }
 
 Object.defineProperty(globalThis, 'RTCPeerConnection', { value: MockRTCPeerConnection, writable: true });
@@ -55,7 +51,7 @@ describe('WebRTCService Audit & Unit Tests', () => {
     expect(service).toBeDefined();
   });
 
-  test('sendMessage sends data via DataChannel', async () => {
+  test('sendMessage relays chat via the signaling WebSocket and echoes it locally', async () => {
     const service = new WebRTCService('demo-room');
     await service.connectToken('mock-jwt-token');
 
@@ -64,9 +60,32 @@ describe('WebRTCService Audit & Unit Tests', () => {
       received = msg;
     };
 
+    const ws = (service as any).ws;
     service.sendMessage('Hello WebRTC');
+
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'chat', text: 'Hello WebRTC' }));
     expect(received).not.toBeNull();
     expect(received.text).toBe('Hello WebRTC');
+    expect(received.sender).toBe('You');
+  });
+
+  test('incoming chat message from another participant triggers onMessageReceived', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let received: any = null;
+    service.onMessageReceived = (msg) => {
+      received = msg;
+    };
+
+    const ws = (service as any).ws;
+    if (ws.onmessage) {
+      ws.onmessage({
+        data: JSON.stringify({ type: 'chat', text: 'Hi there', sender: 'Budi', time: '10:00' }),
+      });
+    }
+
+    expect(received).toEqual({ sender: 'Budi', text: 'Hi there', time: '10:00' });
   });
 
   test('stopScreenShare stops screen tracks and triggers onScreenShareEnded callback', async () => {

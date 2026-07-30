@@ -124,7 +124,14 @@ class EgressWorker {
           '--disable-dev-shm-usage',
           '--autoplay-policy=no-user-gesture-required',
           '--window-size=1920,1080',
-          '--start-fullscreen',
+          '--window-position=0,0',
+          // --start-fullscreen relies on a window manager to actually resize
+          // and reposition the window; there is none under bare Xvfb, so it
+          // can silently no-op and leave Chrome's tab/URL bar on screen,
+          // shrinking the actual page content within the x11grab capture.
+          // --kiosk removes all browser chrome and forces the window to
+          // fill window-size without needing a WM to negotiate it.
+          '--kiosk',
           `--display=${process.env.DISPLAY || ':99'}`,
         ],
         defaultViewport: { width: 1920, height: 1080 },

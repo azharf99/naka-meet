@@ -225,11 +225,11 @@ export const App: React.FC = () => {
           userRole={userRole}
         />
 
-        {/* Real-time Chat Drawer (WebRTC DataChannel) */}
+        {/* Real-time Chat Drawer (relayed by the SFU over the signaling WebSocket) */}
         {chatOpen && (
           <aside className="w-80 h-[calc(100vh-64px)] glass-panel border-l border-slate-800 flex flex-col z-40 transition-all duration-300">
             <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-              <h3 className="font-semibold text-sm text-slate-200">DataChannel Chat</h3>
+              <h3 className="font-semibold text-sm text-slate-200">Chat</h3>
               <button onClick={() => setChatOpen(false)} className="text-slate-400 hover:text-slate-200">
                 <X className="w-4 h-4" />
               </button>
@@ -261,7 +261,7 @@ export const App: React.FC = () => {
                 type="text"
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
-                placeholder="Type message via DataChannel..."
+                placeholder="Type a message..."
                 className="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
               />
               <button

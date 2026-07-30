@@ -3,9 +3,16 @@ package webrtc
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	pion "github.com/pion/webrtc/v4"
 )
+
+// renegotiationStableTimeout bounds how long a renegotiation attempt will
+// wait for a peer's PeerConnection to return to a stable signaling state
+// (e.g. while the browser is still answering a prior offer) before giving
+// up. Real round trips complete in well under a second.
+const renegotiationStableTimeout = 3 * time.Second
 
 type RoomTrack struct {
 	PublisherID   string
@@ -15,11 +22,13 @@ type RoomTrack struct {
 }
 
 type SFURouter struct {
-	api        *pion.API
-	peers      map[string]*pion.PeerConnection
-	roomTracks map[string][]*RoomTrack
-	peerRooms  map[string]string
-	mu         sync.RWMutex
+	api         *pion.API
+	peers       map[string]*pion.PeerConnection
+	roomTracks  map[string][]*RoomTrack
+	peerRooms   map[string]string
+	negoLocks   map[string]*sync.Mutex
+	offerSender func(peerID, sdp string)
+	mu          sync.RWMutex
 }
 
 func NewSFURouter(udpMin, udpMax uint16) (*SFURouter, error) {
@@ -43,7 +52,17 @@ func NewSFURouter(udpMin, udpMax uint16) (*SFURouter, error) {
 		peers:      make(map[string]*pion.PeerConnection),
 		roomTracks: make(map[string][]*RoomTrack),
 		peerRooms:  make(map[string]string),
+		negoLocks:  make(map[string]*sync.Mutex),
 	}, nil
+}
+
+// SetOfferSender registers the default transport used to deliver a
+// server-initiated renegotiation offer to a peer once its signaling state
+// returns to stable. Called once by the signaling handler at startup.
+func (r *SFURouter) SetOfferSender(fn func(peerID, sdp string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.offerSender = fn
 }
 
 func (r *SFURouter) AddPeer(peerID string) (*pion.PeerConnection, error) {
@@ -68,7 +87,62 @@ func (r *SFURouter) AddPeer(peerID string) (*pion.PeerConnection, error) {
 	}
 
 	r.peers[peerID] = pc
+	r.negoLocks[peerID] = &sync.Mutex{}
 	return pc, nil
+}
+
+// RenegotiatePeer triggers a serialized renegotiation attempt for peerID,
+// picking up any tracks that were added to its PeerConnection but not yet
+// offered. Delivery uses the router's default offer sender.
+func (r *SFURouter) RenegotiatePeer(peerID string) {
+	r.renegotiatePeer(peerID, nil)
+}
+
+// renegotiatePeer serializes CreateOffer/SetLocalDescription per target peer
+// so concurrent callers targeting the same peer can never race on its
+// PeerConnection's signaling state (the classic cause of a track silently
+// never getting offered: two tracks from the same publisher, or two
+// publishers joining at once, each try to renegotiate the same subscriber's
+// PeerConnection at nearly the same instant). Renegotiations for different
+// peers proceed independently. If the peer isn't stable right now — most
+// commonly because it's still waiting on the browser's answer to a previous
+// offer — this waits (bounded by renegotiationStableTimeout) instead of
+// dropping the attempt, since that in-flight negotiation is expected to
+// resolve within a normal network round trip.
+func (r *SFURouter) renegotiatePeer(peerID string, sender func(peerID, sdp string)) {
+	r.mu.RLock()
+	pc, exists := r.peers[peerID]
+	lock := r.negoLocks[peerID]
+	if sender == nil {
+		sender = r.offerSender
+	}
+	r.mu.RUnlock()
+
+	if !exists || pc == nil || lock == nil {
+		return
+	}
+
+	lock.Lock()
+	defer lock.Unlock()
+
+	deadline := time.Now().Add(renegotiationStableTimeout)
+	for pc.SignalingState() != pion.SignalingStateStable {
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		return
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		return
+	}
+	if sender != nil {
+		sender(peerID, offer.SDP)
+	}
 }
 
 func (r *SFURouter) GetPeer(peerID string) (*pion.PeerConnection, bool) {
@@ -100,6 +174,7 @@ func (r *SFURouter) RemovePeer(peerID string) error {
 	if r.peerRooms != nil {
 		delete(r.peerRooms, peerID)
 	}
+	delete(r.negoLocks, peerID)
 
 	// Clean up any tracks published by this peer across all rooms
 	for slug, tracks := range r.roomTracks {
@@ -146,29 +221,35 @@ func (r *SFURouter) BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisher
 		Track:         track,
 	}
 	r.roomTracks[roomSlug] = append(r.roomTracks[roomSlug], rt)
-	r.mu.Unlock()
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for peerID, pc := range r.peers {
+	var targetIDs []string
+	for peerID := range r.peers {
 		if peerID == publisherID {
 			continue
 		}
 		if r.peerRooms[peerID] != roomSlug {
 			continue
 		}
+		targetIDs = append(targetIDs, peerID)
+	}
+	r.mu.Unlock()
 
-		if _, err := pc.AddTrack(track); err == nil {
-			if pc.SignalingState() == pion.SignalingStateStable {
-				offer, err := pc.CreateOffer(nil)
-				if err == nil {
-					if err := pc.SetLocalDescription(offer); err == nil {
-						sendOffer(peerID, offer.SDP)
-					}
-				}
-			}
+	// AddTrack + renegotiation happens outside the map lock, and
+	// renegotiatePeer serializes negotiation per target peer, so concurrent
+	// broadcasts (e.g. camera + mic tracks published back-to-back) can never
+	// race on the same target PeerConnection's signaling state and silently
+	// drop an offer.
+	for _, peerID := range targetIDs {
+		r.mu.RLock()
+		pc, exists := r.peers[peerID]
+		r.mu.RUnlock()
+		if !exists {
+			continue
 		}
+		if _, err := pc.AddTrack(track); err != nil {
+			continue
+		}
+		r.renegotiatePeer(peerID, sendOffer)
 	}
 }
 

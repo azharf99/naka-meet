@@ -105,7 +105,7 @@ export const Controls: React.FC<ControlsProps> = ({
         </button>
 
 
-        {/* DataChannel Chat */}
+        {/* Real-Time Chat */}
         <button
           onClick={onToggleChat}
           className="p-3 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl transition-all duration-200"

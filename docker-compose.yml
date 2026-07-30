@@ -30,9 +30,7 @@ services:
       retries: 5
 
   sfu-backend:
-    build:
-      context: ./apps/sfu
-      dockerfile: Dockerfile
+    image: azharfa/naka-meet-sfu:latest
     container_name: naka-sfu
     ports:
       - "8080:8080"
@@ -48,9 +46,7 @@ services:
       - naka_network
 
   frontend:
-    build:
-      context: ./apps/frontend
-      dockerfile: Dockerfile
+    image: azharfa/naka-meet-frontend:latest
     container_name: naka-frontend
     ports:
       - "3000:3000"
@@ -60,9 +56,7 @@ services:
       - naka_network
 
   egress-worker:
-    build:
-      context: ./apps/egress
-      dockerfile: Dockerfile
+    image: azharfa/naka-meet-egress:latest
     container_name: naka-egress
     env_file:
       - .env
@@ -89,5 +83,4 @@ networks:
 
 volumes:
   pgdata:
-
 

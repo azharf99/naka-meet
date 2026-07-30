@@ -19,6 +19,56 @@ import (
 )
 
 
+// TestSignaling_ServerSendsPeriodicPing guards against a stalled/dead
+// connection sitting registered forever with no liveness detection, which
+// let a single slow client stall broadcastToRoom's write loop for everyone
+// else in the room indefinitely.
+func TestSignaling_ServerSendsPeriodicPing(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+	// Keepalive intervals are per-Handler fields (not package globals), so
+	// shrinking them here only affects connections made on this Handler
+	// instance - no risk of racing another test's connections/goroutines.
+	handler.SetKeepaliveIntervalsForTesting(50*time.Millisecond, 500*time.Millisecond)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	userA, _ := uuid.NewV7()
+	tokenA, _ := auth.GenerateTokenWithName(userA.String(), "UserA", "host", secret, 1*time.Hour)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=ping-room&token=" + tokenA
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer ws.Close()
+
+	pingReceived := make(chan struct{}, 1)
+	ws.SetPingHandler(func(string) error {
+		select {
+		case pingReceived <- struct{}{}:
+		default:
+		}
+		return ws.WriteControl(websocket.PongMessage, nil, time.Now().Add(time.Second))
+	})
+
+	// Reads pump the control-frame handler; the server's ping arrives as a
+	// control frame, not a data message, so ReadMessage just needs to run.
+	go func() {
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-pingReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a ping frame from the server within the configured ping period")
+	}
+}
+
 func TestSignaling_HTTPUpgradeUnauthorized(t *testing.T) {
 	secret := []byte("secret-key")
 	rm := room.NewRoomManager(nil)
@@ -220,6 +270,34 @@ func TestSignaling_RenegotiationOfferOnNewTrack(t *testing.T) {
 	require.NoError(t, err)
 	defer wsB.Close()
 
+	// User B must complete its own initial offer/answer handshake before it
+	// becomes a valid broadcast target (see handler.go's AddPeer comment) —
+	// a peer that never negotiates is never a candidate for renegotiation.
+	clientAPI := pion.NewAPI()
+	clientPC, err := clientAPI.NewPeerConnection(pion.Configuration{})
+	require.NoError(t, err)
+	defer clientPC.Close()
+	_, err = clientPC.AddTransceiverFromKind(pion.RTPCodecTypeAudio)
+	require.NoError(t, err)
+
+	bOffer, err := clientPC.CreateOffer(nil)
+	require.NoError(t, err)
+	require.NoError(t, clientPC.SetLocalDescription(bOffer))
+
+	require.NoError(t, wsB.WriteJSON(map[string]string{
+		"type": "offer",
+		"sdp":  bOffer.SDP,
+	}))
+
+	var ansMsg struct {
+		Type string `json:"type"`
+		SDP  string `json:"sdp"`
+	}
+	require.NoError(t, wsB.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, wsB.ReadJSON(&ansMsg))
+	require.Equal(t, "answer", ansMsg.Type)
+	require.NoError(t, clientPC.SetRemoteDescription(pion.SessionDescription{Type: pion.SDPTypeAnswer, SDP: ansMsg.SDP}))
+
 	// Create mock track and add to room
 	mockTrack, err := pion.NewTrackLocalStaticSample(
 		pion.RTPCodecCapability{MimeType: pion.MimeTypeVP8},
@@ -231,16 +309,110 @@ func TestSignaling_RenegotiationOfferOnNewTrack(t *testing.T) {
 	// Broadcast track & trigger renegotiation offer to User B
 	handler.AddTrackAndRenegotiate("reneg-room", userA.String(), mockTrack)
 
-	// User B should receive renegotiation SDP offer over WebSocket
+	// User B should receive a renegotiation SDP offer over WebSocket, mixed
+	// in with unrelated messages like trickled ICE candidates.
 	var msgB struct {
 		Type string `json:"type"`
 		SDP  string `json:"sdp"`
 	}
-	require.NoError(t, wsB.SetReadDeadline(time.Now().Add(2*time.Second)))
-	err = wsB.ReadJSON(&msgB)
-	require.NoError(t, err, "User B should receive renegotiation SDP offer from SFU")
-	assert.Equal(t, "offer", msgB.Type)
+	receivedOffer := false
+	for i := 0; i < 5; i++ {
+		require.NoError(t, wsB.SetReadDeadline(time.Now().Add(2*time.Second)))
+		if err := wsB.ReadJSON(&msgB); err != nil {
+			break
+		}
+		if msgB.Type == "offer" {
+			receivedOffer = true
+			break
+		}
+	}
+	require.True(t, receivedOffer, "User B should receive renegotiation SDP offer from SFU")
 	assert.NotEmpty(t, msgB.SDP)
+}
+
+// TestSignaling_JoinDuringConcurrentBroadcastDoesNotStallOwnOffer reproduces
+// the "participants can't see host/other participants" bug: a peer that has
+// connected but not yet sent its own join offer must never be treated as a
+// valid broadcast target - otherwise a concurrent publisher's broadcast can
+// push a server-initiated offer into it, corrupting its PeerConnection's
+// signaling state so that its real join offer is later silently rejected.
+func TestSignaling_JoinDuringConcurrentBroadcastDoesNotStallOwnOffer(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	// Publisher A already in the room.
+	userA, _ := uuid.NewV7()
+	tokenA, _ := auth.GenerateTokenWithName(userA.String(), "UserA", "host", secret, 1*time.Hour)
+	wsURLA := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=race-room&token=" + tokenA
+	wsA, _, err := websocket.DefaultDialer.Dial(wsURLA, nil)
+	require.NoError(t, err)
+	defer wsA.Close()
+
+	// User B connects but has NOT sent its own offer yet.
+	userB, _ := uuid.NewV7()
+	tokenB, _ := auth.GenerateTokenWithName(userB.String(), "UserB", "participant", secret, 1*time.Hour)
+	wsURLB := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=race-room&token=" + tokenB
+	wsB, _, err := websocket.DefaultDialer.Dial(wsURLB, nil)
+	require.NoError(t, err)
+	defer wsB.Close()
+
+	// Give the connection goroutine a moment to run past AddPeer/registerConn
+	// (mirrors the real-world window between a peer connecting and the
+	// browser's own offer arriving over the WS).
+	time.Sleep(20 * time.Millisecond)
+
+	mockTrack, err := pion.NewTrackLocalStaticSample(
+		pion.RTPCodecCapability{MimeType: pion.MimeTypeVP8},
+		"video-race",
+		"stream-race",
+	)
+	require.NoError(t, err)
+	// Concurrent broadcast fired into the room while B still hasn't sent its
+	// own offer - before the fix, this would corrupt B's PeerConnection
+	// signaling state via an unsolicited server-initiated offer.
+	handler.AddTrackAndRenegotiate("race-room", userA.String(), mockTrack)
+
+	// Now B sends its own real join offer.
+	clientAPI := pion.NewAPI()
+	clientPC, err := clientAPI.NewPeerConnection(pion.Configuration{})
+	require.NoError(t, err)
+	defer clientPC.Close()
+	_, err = clientPC.AddTransceiverFromKind(pion.RTPCodecTypeAudio)
+	require.NoError(t, err)
+
+	offer, err := clientPC.CreateOffer(nil)
+	require.NoError(t, err)
+	require.NoError(t, clientPC.SetLocalDescription(offer))
+
+	require.NoError(t, wsB.WriteJSON(map[string]string{
+		"type": "offer",
+		"sdp":  offer.SDP,
+	}))
+
+	// Read past any unrelated messages (e.g. trickled ICE candidates) until
+	// the answer to B's own offer arrives.
+	var ansMsg struct {
+		Type string `json:"type"`
+		SDP  string `json:"sdp"`
+	}
+	receivedAnswer := false
+	for i := 0; i < 5; i++ {
+		require.NoError(t, wsB.SetReadDeadline(time.Now().Add(2*time.Second)))
+		if err := wsB.ReadJSON(&ansMsg); err != nil {
+			break
+		}
+		if ansMsg.Type == "answer" {
+			receivedAnswer = true
+			break
+		}
+	}
+	require.True(t, receivedAnswer, "User B should still receive an answer to its own join offer despite the concurrent broadcast")
+	assert.NotEmpty(t, ansMsg.SDP)
 }
 
 func TestSignaling_PreExistingTracksOfferAndMetadataOnJoin(t *testing.T) {
@@ -368,6 +540,66 @@ func TestSignaling_ParticipantLeftBroadcastOnDisconnect(t *testing.T) {
 	require.NoError(t, err, "User A should receive participant_left notification when User B disconnects")
 	assert.Equal(t, "participant_left", msgA.Type)
 	assert.Equal(t, userB.String(), msgA.PeerID)
+}
+
+// TestSignaling_EgressRoleParticipantExemptFromRoomCap reproduces the egress
+// recorder occupying a real slot against the human-facing 50-participant
+// cap: every recording session permanently reduced real headroom in the
+// room. An "egress"-role token must be exempt; a normal role must not be.
+func TestSignaling_EgressRoleParticipantExemptFromRoomCap(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	roomSlug := "cap-room"
+	var conns []*websocket.Conn
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+
+	for i := 0; i < 50; i++ {
+		uid, _ := uuid.NewV7()
+		token, _ := auth.GenerateTokenWithName(uid.String(), "User", "participant", secret, 1*time.Hour)
+		wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=" + roomSlug + "&token=" + token
+		ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		require.NoError(t, err)
+		conns = append(conns, ws)
+	}
+	require.Eventually(t, func() bool {
+		return rm.GetParticipantCount(roomSlug) == 50
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// A normal 51st participant must still be rejected. The WS upgrade
+	// itself succeeds (it happens before the room-capacity check), but the
+	// server immediately closes the connection without adding it to the
+	// room, so it must never be reflected in the participant count.
+	overflowID, _ := uuid.NewV7()
+	overflowToken, _ := auth.GenerateTokenWithName(overflowID.String(), "Overflow", "participant", secret, 1*time.Hour)
+	overflowURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=" + roomSlug + "&token=" + overflowToken
+	overflowWs, _, err := websocket.DefaultDialer.Dial(overflowURL, nil)
+	require.NoError(t, err)
+	defer overflowWs.Close()
+	_, _, readErr := overflowWs.ReadMessage()
+	assert.Error(t, readErr, "a 51st non-egress participant's connection should be closed immediately by the server")
+	assert.Equal(t, 50, rm.GetParticipantCount(roomSlug), "a rejected 51st participant must not be counted in the room")
+
+	// An "egress"-role 51st connection must succeed and be reflected in the
+	// participant count (it's exempt from the cap, not invisible to it).
+	egressID, _ := uuid.NewV7()
+	egressToken, _ := auth.GenerateTokenWithName(egressID.String(), "Egress Recorder", "egress", secret, 1*time.Hour)
+	egressURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=" + roomSlug + "&token=" + egressToken
+	egressWs, _, err := websocket.DefaultDialer.Dial(egressURL, nil)
+	require.NoError(t, err, "an egress-role participant should be exempt from the room cap")
+	defer egressWs.Close()
+	require.Eventually(t, func() bool {
+		return rm.GetParticipantCount(roomSlug) == 51
+	}, 2*time.Second, 10*time.Millisecond, "egress participant should be added despite the room already being at the human-facing cap")
 }
 
 

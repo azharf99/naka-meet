@@ -148,6 +148,63 @@ describe('WebRTCService Audit & Unit Tests', () => {
     expect(addedTracks[0].isScreenShare).toBe(true);
     expect(addedTracks[0].stream.id).toBe('screen-stream-100');
   });
+
+  test('sendMediaState sends the exact expected media_state payload', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const ws = (service as any).ws;
+    service.sendMediaState('mic', false);
+
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({ type: 'media_state', media_kind: 'mic', enabled: false })
+    );
+  });
+
+  test('incoming media_state prefers peer_name over peer_id for onMediaStateChanged, matching onTrackAdded convention', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let received: any = null;
+    service.onMediaStateChanged = (state) => {
+      received = state;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({
+      data: JSON.stringify({
+        type: 'media_state',
+        media_kind: 'cam',
+        enabled: false,
+        peer_id: 'user-uuid-1',
+        peer_name: 'Bob',
+      }),
+    });
+
+    expect(received).toEqual({ peerId: 'Bob', kind: 'cam', enabled: false });
+  });
+
+  test('incoming media_state falls back to peer_id when peer_name is absent', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let received: any = null;
+    service.onMediaStateChanged = (state) => {
+      received = state;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({
+      data: JSON.stringify({
+        type: 'media_state',
+        media_kind: 'mic',
+        enabled: true,
+        peer_id: 'user-uuid-2',
+      }),
+    });
+
+    expect(received).toEqual({ peerId: 'user-uuid-2', kind: 'mic', enabled: true });
+  });
 });
 
 

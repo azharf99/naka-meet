@@ -18,10 +18,11 @@ var (
 const MaxRoomParticipants = 50
 
 type Participant struct {
-	ID             string        `json:"id"`
-	Name           string        `json:"name"`
-	JoinedAt       time.Time     `json:"joined_at"`
-	reconnectTimer *time.Timer   `json:"-"`
+	ID             string      `json:"id"`
+	Name           string      `json:"name"`
+	JoinedAt       time.Time   `json:"joined_at"`
+	IsEgress       bool        `json:"is_egress,omitempty"`
+	reconnectTimer *time.Timer `json:"-"`
 }
 
 type Room struct {
@@ -78,15 +79,21 @@ func (rm *RoomManager) AddParticipant(ctx context.Context, slug string, p *Parti
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(r.Participants) >= MaxRoomParticipants {
+	// A reconnect (same participant ID already present, e.g. a brief network
+	// blip during the 15s HandleDisconnect grace window) must never be
+	// rejected by the capacity cap — it's not a new occupant, it's replacing
+	// its own existing entry. Checking existence before the cap, and
+	// exempting egress recorder identities from the cap entirely, are both
+	// required or a room sitting at 50 can turn transient disconnects (or a
+	// recording session) into unrecoverable "room full" kicks.
+	existing, isReconnect := r.Participants[p.ID]
+
+	if !isReconnect && !p.IsEgress && len(r.Participants) >= MaxRoomParticipants {
 		return ErrRoomFull
 	}
 
-	// Cancel existing reconnect timer if any
-	if existing, found := r.Participants[p.ID]; found {
-		if existing.reconnectTimer != nil {
-			existing.reconnectTimer.Stop()
-		}
+	if isReconnect && existing.reconnectTimer != nil {
+		existing.reconnectTimer.Stop()
 	}
 
 	r.Participants[p.ID] = p

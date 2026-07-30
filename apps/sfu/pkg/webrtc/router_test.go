@@ -3,6 +3,7 @@ package webrtc_test
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/naka-meet/sfu/pkg/webrtc"
 	pion "github.com/pion/webrtc/v4"
@@ -186,6 +187,112 @@ func TestSFURouter_ConcurrentTrackPublishDoesNotDropRenegotiation(t *testing.T) 
 	cbMu.Lock()
 	defer cbMu.Unlock()
 	assert.Equal(t, 2, offersReceived, "Both concurrent renegotiation attempts should deliver an offer, not silently drop one")
+}
+
+// TestSFURouter_RenegotiationDeferredUntilStableThenDelivered reproduces the
+// other half of the "host can't see all participant videos" bug: previously,
+// if a target peer's PeerConnection wasn't stable within a fixed 3s timeout,
+// renegotiatePeer gave up permanently even though the corresponding AddTrack
+// had already happened - the track would never be announced via SDP unless
+// some unrelated future renegotiation happened to fire. This asserts the
+// offer is deferred (not dropped) and delivered once the peer returns to
+// stable, with no fixed timeout involved.
+func TestSFURouter_RenegotiationDeferredUntilStableThenDelivered(t *testing.T) {
+	router, err := webrtc.NewSFURouter(50000, 50050)
+	require.NoError(t, err)
+
+	pubID := "publisher-deferred"
+	subID := "subscriber-deferred"
+	roomSlug := "deferred-room"
+
+	_, err = router.AddPeer(pubID)
+	require.NoError(t, err)
+	subPC, err := router.AddPeer(subID)
+	require.NoError(t, err)
+	router.SetPeerRoom(pubID, roomSlug)
+	router.SetPeerRoom(subID, roomSlug)
+
+	// Simulate an in-flight negotiation already underway on the subscriber's
+	// PeerConnection (e.g. it just joined and its own offer hasn't been
+	// answered yet) by driving it into HaveLocalOffer before the broadcast.
+	_, err = subPC.AddTransceiverFromKind(pion.RTPCodecTypeAudio)
+	require.NoError(t, err)
+	inFlightOffer, err := subPC.CreateOffer(nil)
+	require.NoError(t, err)
+	require.NoError(t, subPC.SetLocalDescription(inFlightOffer))
+	require.Equal(t, pion.SignalingStateHaveLocalOffer, subPC.SignalingState())
+
+	fakeClientPC, err := pion.NewAPI().NewPeerConnection(pion.Configuration{})
+	require.NoError(t, err)
+	defer fakeClientPC.Close()
+
+	var mu sync.Mutex
+	offersReceived := 0
+	sendOfferCb := func(peerID, offerSDP string) {
+		mu.Lock()
+		offersReceived++
+		mu.Unlock()
+	}
+
+	videoTrack, err := pion.NewTrackLocalStaticSample(pion.RTPCodecCapability{MimeType: pion.MimeTypeVP8}, "video-1", "stream-deferred")
+	require.NoError(t, err)
+
+	router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, pubID, "Publisher", "camera", videoTrack, sendOfferCb)
+
+	mu.Lock()
+	assert.Equal(t, 0, offersReceived, "renegotiation should be deferred, not dropped, while the subscriber PC isn't stable")
+	mu.Unlock()
+
+	// Resolve the in-flight negotiation by answering it, returning the
+	// subscriber's PC to stable - this should trigger the deferred retry via
+	// AddPeer's OnSignalingStateChange handler.
+	require.NoError(t, fakeClientPC.SetRemoteDescription(inFlightOffer))
+	answer, err := fakeClientPC.CreateAnswer(nil)
+	require.NoError(t, err)
+	require.NoError(t, fakeClientPC.SetLocalDescription(answer))
+	require.NoError(t, subPC.SetRemoteDescription(answer))
+
+	assert.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return offersReceived == 1
+	}, 2*time.Second, 10*time.Millisecond, "deferred renegotiation should be delivered once the subscriber PC returns to stable")
+}
+
+// TestSFURouter_SubscribePeerToRoomTracksSkipsAlreadyBroadcastTrack
+// reproduces the secondary defect from the join-race: if a track was already
+// pushed onto a peer's PeerConnection via the live broadcast fan-out path,
+// the pre-existing-tracks catch-up subscription must not add it again -
+// doing so would create a second, duplicate sender for identical media.
+func TestSFURouter_SubscribePeerToRoomTracksSkipsAlreadyBroadcastTrack(t *testing.T) {
+	router, err := webrtc.NewSFURouter(50000, 50050)
+	require.NoError(t, err)
+
+	pubID := "publisher-dedup"
+	subID := "subscriber-dedup"
+	roomSlug := "dedup-room"
+
+	_, err = router.AddPeer(pubID)
+	require.NoError(t, err)
+	subPC, err := router.AddPeer(subID)
+	require.NoError(t, err)
+	router.SetPeerRoom(pubID, roomSlug)
+	router.SetPeerRoom(subID, roomSlug)
+
+	mockTrack, err := pion.NewTrackLocalStaticSample(pion.RTPCodecCapability{MimeType: pion.MimeTypeVP8}, "video-dedup", "stream-dedup")
+	require.NoError(t, err)
+
+	// Broadcast delivers the track directly onto the subscriber's PC (the
+	// live fan-out path)...
+	router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, pubID, "Publisher", "camera", mockTrack, func(string, string) {})
+	require.Len(t, subPC.GetSenders(), 1)
+
+	// ...so the catch-up subscription path for the same room must skip it
+	// instead of adding a second, duplicate sender for identical media.
+	count, err := router.SubscribePeerToRoomTracks(roomSlug, subID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "already-broadcast track should not be subscribed again")
+	assert.Len(t, subPC.GetSenders(), 1, "subscriber should not end up with a duplicate sender for the same track")
 }
 
 

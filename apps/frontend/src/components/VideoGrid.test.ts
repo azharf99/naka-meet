@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { getGridClass, deduplicateTracks, getInitials } from './VideoGrid';
+import { getGridClass, deduplicateTracks, getInitials, deriveVisibility } from './VideoGrid';
 
 describe('VideoGrid Helper Tests', () => {
   test('getGridClass assigns dynamic layout based on total participant count', () => {
@@ -37,6 +37,50 @@ describe('VideoGrid Helper Tests', () => {
     expect(getInitials('Budi Ganteng')).toBe('BG');
     expect(getInitials('Azhar')).toBe('AZ');
     expect(getInitials('User (You)')).toBe('US');
+  });
+
+  describe('deriveVisibility (mute/camera-off state)', () => {
+    test('an explicit mute/cam-off signal wins over the track-based heuristic', () => {
+      // hasAudio/hasVideo say "on", but the media_state relay says otherwise.
+      expect(deriveVisibility(true, true, true, true, true, false)).toEqual({
+        showVideoFallback: true,
+        showMicMuted: true,
+      });
+    });
+
+    test('an explicit false signal suppresses the badge even if the heuristic disagrees', () => {
+      // hasAudio/hasVideo say "off" (e.g. stream not yet flowing), but an
+      // explicit unmuted/camera-on signal has already arrived.
+      expect(deriveVisibility(false, false, false, false, true, false)).toEqual({
+        showVideoFallback: false,
+        showMicMuted: false,
+      });
+    });
+
+    test('undefined signal (no media_state received yet) falls back to the track-based heuristic', () => {
+      expect(deriveVisibility(undefined, undefined, false, false, true, false)).toEqual({
+        showVideoFallback: true,
+        showMicMuted: true,
+      });
+      expect(deriveVisibility(undefined, undefined, true, true, true, false)).toEqual({
+        showVideoFallback: false,
+        showMicMuted: false,
+      });
+    });
+
+    test('no stream at all always shows the video fallback regardless of any signal', () => {
+      expect(deriveVisibility(false, false, true, true, false, false)).toEqual({
+        showVideoFallback: true,
+        showMicMuted: false,
+      });
+    });
+
+    test('screen-share tiles never show the video fallback', () => {
+      expect(deriveVisibility(undefined, true, false, false, true, true)).toEqual({
+        showVideoFallback: false,
+        showMicMuted: true,
+      });
+    });
   });
 });
 

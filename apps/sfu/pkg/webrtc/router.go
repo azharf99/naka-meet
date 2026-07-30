@@ -2,17 +2,11 @@ package webrtc
 
 import (
 	"fmt"
+	"log"
 	"sync"
-	"time"
 
 	pion "github.com/pion/webrtc/v4"
 )
-
-// renegotiationStableTimeout bounds how long a renegotiation attempt will
-// wait for a peer's PeerConnection to return to a stable signaling state
-// (e.g. while the browser is still answering a prior offer) before giving
-// up. Real round trips complete in well under a second.
-const renegotiationStableTimeout = 3 * time.Second
 
 type RoomTrack struct {
 	PublisherID   string
@@ -22,13 +16,15 @@ type RoomTrack struct {
 }
 
 type SFURouter struct {
-	api         *pion.API
-	peers       map[string]*pion.PeerConnection
-	roomTracks  map[string][]*RoomTrack
-	peerRooms   map[string]string
-	negoLocks   map[string]*sync.Mutex
-	offerSender func(peerID, sdp string)
-	mu          sync.RWMutex
+	api                  *pion.API
+	peers                map[string]*pion.PeerConnection
+	roomTracks           map[string][]*RoomTrack
+	peerRooms            map[string]string
+	negoLocks            map[string]*sync.Mutex
+	subscribedTracks     map[string]map[*RoomTrack]struct{}
+	pendingRenegotiation map[string]func(peerID, sdp string)
+	offerSender          func(peerID, sdp string)
+	mu                   sync.RWMutex
 }
 
 func NewSFURouter(udpMin, udpMax uint16) (*SFURouter, error) {
@@ -48,11 +44,13 @@ func NewSFURouter(udpMin, udpMax uint16) (*SFURouter, error) {
 	)
 
 	return &SFURouter{
-		api:        api,
-		peers:      make(map[string]*pion.PeerConnection),
-		roomTracks: make(map[string][]*RoomTrack),
-		peerRooms:  make(map[string]string),
-		negoLocks:  make(map[string]*sync.Mutex),
+		api:                  api,
+		peers:                make(map[string]*pion.PeerConnection),
+		roomTracks:           make(map[string][]*RoomTrack),
+		peerRooms:            make(map[string]string),
+		negoLocks:            make(map[string]*sync.Mutex),
+		subscribedTracks:     make(map[string]map[*RoomTrack]struct{}),
+		pendingRenegotiation: make(map[string]func(peerID, sdp string)),
 	}, nil
 }
 
@@ -88,7 +86,59 @@ func (r *SFURouter) AddPeer(peerID string) (*pion.PeerConnection, error) {
 
 	r.peers[peerID] = pc
 	r.negoLocks[peerID] = &sync.Mutex{}
+
+	// If a renegotiation attempt was deferred because this peer's PC wasn't
+	// stable yet (see renegotiatePeer), fire it as soon as the PC returns to
+	// stable instead of relying on a timeout that would otherwise drop it.
+	pc.OnSignalingStateChange(func(state pion.SignalingState) {
+		if state == pion.SignalingStateStable {
+			go r.retryPendingRenegotiation(peerID)
+		}
+	})
+
 	return pc, nil
+}
+
+// retryPendingRenegotiation delivers a renegotiation attempt that was
+// deferred by renegotiatePeer while peerID's PC was mid-negotiation, once
+// that PC has returned to a stable signaling state.
+func (r *SFURouter) retryPendingRenegotiation(peerID string) {
+	r.mu.Lock()
+	sender, pending := r.pendingRenegotiation[peerID]
+	if pending {
+		delete(r.pendingRenegotiation, peerID)
+	}
+	r.mu.Unlock()
+
+	if pending {
+		r.renegotiatePeer(peerID, sender)
+	}
+}
+
+// markSubscribed records that rt has been (or is about to be) added as a
+// sender on peerID's PeerConnection, so it is never added twice — once via
+// BroadcastTrackAndRenegotiateWithMetadata's live fan-out and again via
+// SubscribePeerToRoomTracks' catch-up pass for pre-existing tracks — which
+// would otherwise create a second independent sender for identical media.
+// Must be called with r.mu held for writing.
+func (r *SFURouter) markSubscribed(peerID string, rt *RoomTrack) bool {
+	set, ok := r.subscribedTracks[peerID]
+	if !ok {
+		set = make(map[*RoomTrack]struct{})
+		r.subscribedTracks[peerID] = set
+	}
+	if _, exists := set[rt]; exists {
+		return false
+	}
+	set[rt] = struct{}{}
+	return true
+}
+
+// unmarkSubscribed must be called with r.mu held for writing.
+func (r *SFURouter) unmarkSubscribed(peerID string, rt *RoomTrack) {
+	if set, ok := r.subscribedTracks[peerID]; ok {
+		delete(set, rt)
+	}
 }
 
 // RenegotiatePeer triggers a serialized renegotiation attempt for peerID,
@@ -106,9 +156,10 @@ func (r *SFURouter) RenegotiatePeer(peerID string) {
 // PeerConnection at nearly the same instant). Renegotiations for different
 // peers proceed independently. If the peer isn't stable right now — most
 // commonly because it's still waiting on the browser's answer to a previous
-// offer — this waits (bounded by renegotiationStableTimeout) instead of
-// dropping the attempt, since that in-flight negotiation is expected to
-// resolve within a normal network round trip.
+// offer — this defers the attempt instead of blocking or dropping it:
+// AddPeer's OnSignalingStateChange handler retries it as soon as the PC
+// returns to stable, and CreateOffer always captures the full current
+// sender set, so the retry picks up every track added in the meantime.
 func (r *SFURouter) renegotiatePeer(peerID string, sender func(peerID, sdp string)) {
 	r.mu.RLock()
 	pc, exists := r.peers[peerID]
@@ -125,19 +176,21 @@ func (r *SFURouter) renegotiatePeer(peerID string, sender func(peerID, sdp strin
 	lock.Lock()
 	defer lock.Unlock()
 
-	deadline := time.Now().Add(renegotiationStableTimeout)
-	for pc.SignalingState() != pion.SignalingStateStable {
-		if time.Now().After(deadline) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if pc.SignalingState() != pion.SignalingStateStable {
+		r.mu.Lock()
+		r.pendingRenegotiation[peerID] = sender
+		r.mu.Unlock()
+		log.Printf("renegotiatePeer: %s not stable (state=%s), deferring until stable", peerID, pc.SignalingState())
+		return
 	}
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
+		log.Printf("renegotiatePeer: CreateOffer failed for %s: %v", peerID, err)
 		return
 	}
 	if err := pc.SetLocalDescription(offer); err != nil {
+		log.Printf("renegotiatePeer: SetLocalDescription failed for %s: %v", peerID, err)
 		return
 	}
 	if sender != nil {
@@ -175,6 +228,8 @@ func (r *SFURouter) RemovePeer(peerID string) error {
 		delete(r.peerRooms, peerID)
 	}
 	delete(r.negoLocks, peerID)
+	delete(r.subscribedTracks, peerID)
+	delete(r.pendingRenegotiation, peerID)
 
 	// Clean up any tracks published by this peer across all rooms
 	for slug, tracks := range r.roomTracks {
@@ -240,13 +295,25 @@ func (r *SFURouter) BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisher
 	// race on the same target PeerConnection's signaling state and silently
 	// drop an offer.
 	for _, peerID := range targetIDs {
-		r.mu.RLock()
+		r.mu.Lock()
 		pc, exists := r.peers[peerID]
-		r.mu.RUnlock()
 		if !exists {
+			r.mu.Unlock()
 			continue
 		}
+		// A peer that joined mid-broadcast may already have this exact
+		// track subscribed via SubscribePeerToRoomTracks' catch-up pass; skip
+		// it here to avoid adding a second, duplicate sender for it.
+		if !r.markSubscribed(peerID, rt) {
+			r.mu.Unlock()
+			continue
+		}
+		r.mu.Unlock()
+
 		if _, err := pc.AddTrack(track); err != nil {
+			r.mu.Lock()
+			r.unmarkSubscribed(peerID, rt)
+			r.mu.Unlock()
 			continue
 		}
 		r.renegotiatePeer(peerID, sendOffer)
@@ -263,8 +330,8 @@ func (r *SFURouter) GetRoomTracks(roomSlug string) []*RoomTrack {
 }
 
 func (r *SFURouter) SubscribePeerToRoomTracks(roomSlug, peerID string, onSubscribe func(rt *RoomTrack)) (int, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	pc, exists := r.peers[peerID]
 	if !exists {
@@ -277,11 +344,20 @@ func (r *SFURouter) SubscribePeerToRoomTracks(roomSlug, peerID string, onSubscri
 		if rt.PublisherID == peerID {
 			continue
 		}
+		// Skip a track already subscribed via a concurrent
+		// BroadcastTrackAndRenegotiateWithMetadata call targeting this same
+		// peer (the join-window race) — adding it again would create a
+		// second, duplicate sender for identical media.
+		if !r.markSubscribed(peerID, rt) {
+			continue
+		}
 		if _, err := pc.AddTrack(rt.Track); err == nil {
 			if onSubscribe != nil {
 				onSubscribe(rt)
 			}
 			count++
+		} else {
+			r.unmarkSubscribed(peerID, rt)
 		}
 	}
 	return count, nil

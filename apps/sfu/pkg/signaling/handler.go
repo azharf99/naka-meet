@@ -22,16 +22,24 @@ type SignalMessage struct {
 	StreamID  string          `json:"stream_id,omitempty"`
 	Kind      string          `json:"kind,omitempty"`
 	Text      string          `json:"text,omitempty"`
+	MediaKind string          `json:"media_kind,omitempty"`
+	Enabled   bool            `json:"enabled,omitempty"`
 }
 
+// SafeConn wraps a *websocket.Conn with a mutex (gorilla/websocket panics on
+// concurrent writes) and a write deadline, applied on every write, so a
+// single stalled client can never block broadcastToRoom's write loop
+// (held under Handler.mu) for the rest of the room indefinitely.
 type SafeConn struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn      *websocket.Conn
+	writeWait time.Duration
+	mu        sync.Mutex
 }
 
 func (sc *SafeConn) WriteMessage(messageType int, data []byte) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	_ = sc.conn.SetWriteDeadline(time.Now().Add(sc.writeWait))
 	return sc.conn.WriteMessage(messageType, data)
 }
 
@@ -49,9 +57,21 @@ type Handler struct {
 	conns       map[string]map[string]*SafeConn
 	connsByUser map[string]*SafeConn
 	mu          sync.RWMutex
+
+	// WebSocket liveness-detection intervals, per-Handler (not package
+	// globals) so tests can shrink them on one Handler instance without
+	// racing against other tests' connections/goroutines. Without these, a
+	// stalled/dead connection is never proactively detected: a single slow
+	// client's blocking write inside broadcastToRoom could stall delivery to
+	// an entire room, and a dropped connection with no clean close would
+	// never be reaped.
+	wsWriteWait  time.Duration
+	wsPongWait   time.Duration
+	wsPingPeriod time.Duration
 }
 
 func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte) *Handler {
+	pongWait := 60 * time.Second
 	h := &Handler{
 		rm:        rm,
 		router:    router,
@@ -61,14 +81,26 @@ func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte
 				return true
 			},
 		},
-		conns:       make(map[string]map[string]*SafeConn),
-		connsByUser: make(map[string]*SafeConn),
+		conns:        make(map[string]map[string]*SafeConn),
+		connsByUser:  make(map[string]*SafeConn),
+		wsWriteWait:  10 * time.Second,
+		wsPongWait:   pongWait,
+		wsPingPeriod: (pongWait * 9) / 10,
 	}
 	// Lets the router deliver a renegotiation offer to any peer (e.g. one
 	// that was deferred because the peer's signaling state wasn't stable
 	// when a track was published) without needing to know its room.
 	router.SetOfferSender(h.sendOfferToPeer)
 	return h
+}
+
+// SetKeepaliveIntervalsForTesting overrides this Handler's WS keepalive
+// intervals. Test-only; call before any connections are made on this
+// Handler, since existing connections capture the values at connect time.
+func (h *Handler) SetKeepaliveIntervalsForTesting(ping, pong time.Duration) {
+	h.wsWriteWait = ping
+	h.wsPongWait = pong
+	h.wsPingPeriod = ping
 }
 
 func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) {
@@ -173,8 +205,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to upgrade WebSocket: %v", err)
 		return
 	}
-	safeConn := &SafeConn{conn: conn}
+	safeConn := &SafeConn{conn: conn, writeWait: h.wsWriteWait}
 	defer safeConn.Close()
+
+	// Proactive liveness detection: without a deadline+pong refresh, a dead
+	// TCP connection (no clean WS close) would sit registered forever, and
+	// broadcastToRoom would keep trying to write to it. The read deadline is
+	// refreshed on every pong; if pings stop getting answered (network died,
+	// or this goroutine's peer is starved of CPU for too long), ReadMessage
+	// in the main loop below eventually times out and triggers the normal
+	// cleanup path — same effect as any other read error.
+	_ = conn.SetReadDeadline(time.Now().Add(h.wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(h.wsPongWait))
+	})
+
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		ticker := time.NewTicker(h.wsPingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := safeConn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					_ = safeConn.Close()
+					return
+				}
+			case <-pingDone:
+				return
+			}
+		}
+	}()
 
 	// 3. Add to Room Manager
 	displayName := claims.Name
@@ -185,6 +247,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ID:       claims.UserID,
 		Name:     displayName,
 		JoinedAt: time.Now(),
+		IsEgress: claims.Role == "egress",
 	}
 
 	_, _ = h.rm.CreateOrGetRoom(r.Context(), roomSlug, claims.UserID)
@@ -200,7 +263,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to create PeerConnection: %v", err)
 		return
 	}
-	h.router.SetPeerRoom(claims.UserID, roomSlug)
+	// SetPeerRoom is deliberately NOT called here. Doing so would make this
+	// peer a valid BroadcastTrackAndRenegotiateWithMetadata target before it
+	// has processed its own initial "offer" below — a concurrent broadcast
+	// could push a server-initiated offer into this still-stable PC, flip it
+	// to HaveLocalOffer, and then the client's real offer arriving via the
+	// message loop would be an invalid SetRemoteDescription transition and
+	// get silently rejected, stranding this peer forever. SetPeerRoom is
+	// called instead once this peer's own offer/answer exchange is durably
+	// complete (see the "offer" case below).
 
 	h.registerConn(roomSlug, claims.UserID, safeConn)
 	defer func() {
@@ -287,38 +358,63 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					Type: pion.SDPTypeOffer,
 					SDP:  msg.SDP,
 				}
-				if err := pc.SetRemoteDescription(offer); err == nil {
-					answer, err := pc.CreateAnswer(nil)
-					if err == nil {
-						if err := pc.SetLocalDescription(answer); err == nil {
-							ansBytes, _ := json.Marshal(map[string]interface{}{
-								"type": "answer",
-								"sdp":  answer.SDP,
-							})
-							_ = safeConn.WriteMessage(websocket.TextMessage, ansBytes)
-
-							// Subscribe peer to any pre-existing active room tracks AFTER initial answer is sent
-							count, _ := h.router.SubscribePeerToRoomTracks(roomSlug, claims.UserID, func(rt *webrtc.RoomTrack) {
-								metaBytes, _ := json.Marshal(map[string]interface{}{
-									"type":      "track_metadata",
-									"stream_id": rt.Track.StreamID(),
-									"track_id":  rt.Track.ID(),
-									"peer_id":   rt.PublisherID,
-									"peer_name": rt.PublisherName,
-									"kind":      rt.Kind,
-								})
-								_ = safeConn.WriteMessage(websocket.TextMessage, metaBytes)
-							})
-
-							// Routed through the router's serialized renegotiation path
-							// (not an inline CreateOffer here) so this doesn't race a
-							// concurrent renegotiation triggered by another publisher's
-							// OnTrack callback firing for this same brand-new peer.
-							if count > 0 {
-								h.router.RenegotiatePeer(claims.UserID)
-							}
-						}
+				remoteErr := pc.SetRemoteDescription(offer)
+				if remoteErr != nil && pc.SignalingState() == pion.SignalingStateHaveLocalOffer {
+					// A server-initiated offer raced this client's own join
+					// offer (see the AddPeer comment above) and won, leaving
+					// the PC in HaveLocalOffer. Roll back once and retry —
+					// this peer's own offer takes priority for its join.
+					if rbErr := pc.SetLocalDescription(pion.SessionDescription{Type: pion.SDPTypeRollback}); rbErr != nil {
+						log.Printf("offer: rollback failed for %s: %v", claims.UserID, rbErr)
+					} else {
+						remoteErr = pc.SetRemoteDescription(offer)
 					}
+				}
+				if remoteErr != nil {
+					log.Printf("offer: SetRemoteDescription failed for %s: %v", claims.UserID, remoteErr)
+					continue
+				}
+
+				answer, err := pc.CreateAnswer(nil)
+				if err != nil {
+					log.Printf("offer: CreateAnswer failed for %s: %v", claims.UserID, err)
+					continue
+				}
+				if err := pc.SetLocalDescription(answer); err != nil {
+					log.Printf("offer: SetLocalDescription failed for %s: %v", claims.UserID, err)
+					continue
+				}
+
+				ansBytes, _ := json.Marshal(map[string]interface{}{
+					"type": "answer",
+					"sdp":  answer.SDP,
+				})
+				_ = safeConn.WriteMessage(websocket.TextMessage, ansBytes)
+
+				// Only now — after this peer's own offer/answer exchange is
+				// durably complete — does it become a valid broadcast target
+				// for other publishers' tracks. See the AddPeer comment above.
+				h.router.SetPeerRoom(claims.UserID, roomSlug)
+
+				// Subscribe peer to any pre-existing active room tracks AFTER initial answer is sent
+				count, _ := h.router.SubscribePeerToRoomTracks(roomSlug, claims.UserID, func(rt *webrtc.RoomTrack) {
+					metaBytes, _ := json.Marshal(map[string]interface{}{
+						"type":      "track_metadata",
+						"stream_id": rt.Track.StreamID(),
+						"track_id":  rt.Track.ID(),
+						"peer_id":   rt.PublisherID,
+						"peer_name": rt.PublisherName,
+						"kind":      rt.Kind,
+					})
+					_ = safeConn.WriteMessage(websocket.TextMessage, metaBytes)
+				})
+
+				// Routed through the router's serialized renegotiation path
+				// (not an inline CreateOffer here) so this doesn't race a
+				// concurrent renegotiation triggered by another publisher's
+				// OnTrack callback firing for this same brand-new peer.
+				if count > 0 {
+					h.router.RenegotiatePeer(claims.UserID)
 				}
 			}
 		case "answer":
@@ -347,6 +443,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				h.broadcastToRoom(roomSlug, claims.UserID, messageBytes)
 			}
+
+		case "media_state":
+			// Self-mute/camera-off relay: a sender only ever toggles its own
+			// local track's `.enabled`, which produces no observable event on
+			// the corresponding remote track on other peers' PeerConnections
+			// (per WebRTC spec) — so without this out-of-band message, other
+			// participants have no way to know. peer_id/peer_name are always
+			// server-enriched, never trusted from the client, matching
+			// track_metadata's pattern above.
+			if msg.MediaKind != "mic" && msg.MediaKind != "cam" {
+				continue
+			}
+			stateBytes, _ := json.Marshal(map[string]interface{}{
+				"type":       "media_state",
+				"media_kind": msg.MediaKind,
+				"enabled":    msg.Enabled,
+				"peer_id":    claims.UserID,
+				"peer_name":  displayName,
+			})
+			h.broadcastToRoom(roomSlug, claims.UserID, stateBytes)
 
 		case "chat":
 			// Every client only has a PeerConnection to the SFU (hub-and-spoke,

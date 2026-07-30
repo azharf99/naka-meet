@@ -20,6 +20,8 @@ export const App: React.FC = () => {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const [remoteTracks, setRemoteTracks] = useState<ParticipantTrack[]>([]);
+  const [remoteMediaState, setRemoteMediaState] = useState<Map<string, { mic: boolean; cam: boolean }>>(new Map());
+  const [connectionLost, setConnectionLost] = useState(false);
 
   const [chatOpen, setChatOpen] = useState(false);
   const [messages, setMessages] = useState<Array<{ sender: string; text: string; time: string }>>([]);
@@ -107,6 +109,14 @@ export const App: React.FC = () => {
                 t.stream?.id !== idOrPeerId
             )
           );
+          // Prevents a stale mute/cam-off badge from surviving a participant
+          // leaving and a later participant reusing the same display name.
+          setRemoteMediaState((prev) => {
+            if (!prev.has(idOrPeerId)) return prev;
+            const next = new Map(prev);
+            next.delete(idOrPeerId);
+            return next;
+          });
         };
 
         service.onScreenShareEnded = () => {
@@ -118,7 +128,21 @@ export const App: React.FC = () => {
           setMessages((prev) => [...prev, msg]);
         };
 
+        service.onMediaStateChanged = ({ peerId, kind, enabled }) => {
+          setRemoteMediaState((prev) => {
+            const next = new Map(prev);
+            const cur = next.get(peerId) || { mic: true, cam: true };
+            next.set(peerId, { ...cur, [kind]: enabled });
+            return next;
+          });
+        };
+
+        service.onDisconnected = () => {
+          setConnectionLost(true);
+        };
+
         await service.connectToken(token);
+        setConnectionLost(false);
         setLocalStream(service.getLocalStream());
         setWebrtcService(service);
       } catch (err) {
@@ -223,7 +247,14 @@ export const App: React.FC = () => {
           remoteTracks={remoteTracks}
           displayName={displayName}
           userRole={userRole}
+          remoteMediaState={remoteMediaState}
         />
+
+        {connectionLost && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-red-500/90 text-white text-xs font-medium rounded-lg shadow-lg backdrop-blur-md">
+            Connection lost — please reload to rejoin.
+          </div>
+        )}
 
         {/* Real-time Chat Drawer (relayed by the SFU over the signaling WebSocket) */}
         {chatOpen && (
@@ -284,11 +315,15 @@ export const App: React.FC = () => {
         onToggleMic={() => {
           if (localStream) {
             localStream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
+            const nowEnabled = localStream.getAudioTracks()[0]?.enabled ?? true;
+            webrtcService?.sendMediaState('mic', nowEnabled);
           }
         }}
         onToggleCam={() => {
           if (localStream) {
             localStream.getVideoTracks().forEach((t) => (t.enabled = !t.enabled));
+            const nowEnabled = localStream.getVideoTracks()[0]?.enabled ?? true;
+            webrtcService?.sendMediaState('cam', nowEnabled);
           }
         }}
         onScreenShare={async () => {

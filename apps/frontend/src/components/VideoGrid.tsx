@@ -8,6 +8,7 @@ interface VideoGridProps {
   remoteTracks: ParticipantTrack[];
   displayName?: string;
   userRole?: string;
+  remoteMediaState?: Map<string, { mic: boolean; cam: boolean }>;
 }
 
 export function getGridClass(totalTiles: number): string {
@@ -48,12 +49,31 @@ export function getInitials(name: string): string {
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
+export function deriveVisibility(
+  isMicMuted: boolean | undefined,
+  isCamOff: boolean | undefined,
+  hasAudio: boolean,
+  hasVideo: boolean,
+  hasStream: boolean,
+  isScreen: boolean
+): { showVideoFallback: boolean; showMicMuted: boolean } {
+  return {
+    // An explicit signal (from the media_state relay) always wins over the
+    // track-based heuristic, which can't observe a remote peer's own local
+    // mute/cam-off toggle per WebRTC spec. Fall back to the heuristic only
+    // when no signal has arrived yet (isCamOff/isMicMuted === undefined).
+    showVideoFallback: !isScreen && (isCamOff === true || !hasStream || (isCamOff === undefined && !hasVideo)),
+    showMicMuted: isMicMuted === true || (isMicMuted === undefined && !hasAudio),
+  };
+}
+
 const VideoTile: React.FC<{
   stream?: MediaStream | null;
   label: string;
   isScreen?: boolean;
   isMicMuted?: boolean;
-}> = ({ stream, label, isScreen, isMicMuted }) => {
+  isCamOff?: boolean;
+}> = ({ stream, label, isScreen, isMicMuted, isCamOff }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
@@ -98,8 +118,7 @@ const VideoTile: React.FC<{
   }, [stream]);
 
   const initials = getInitials(label);
-  const showVideoFallback = !isScreen && (!stream || !hasVideo);
-  const showMicMuted = isMicMuted || !hasAudio;
+  const { showVideoFallback, showMicMuted } = deriveVisibility(isMicMuted, isCamOff, hasAudio, hasVideo, !!stream, !!isScreen);
 
   return (
     <div className="relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center w-full h-full">
@@ -150,6 +169,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   remoteTracks,
   displayName = 'You',
   userRole = 'host',
+  remoteMediaState,
 }) => {
   const uniqueTracks = deduplicateTracks(remoteTracks);
   const remoteScreenTrack = uniqueTracks.find((t) => t.isScreenShare);
@@ -174,11 +194,22 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
           <div className="flex-1 min-h-0">
             <VideoTile stream={localStream} label={localLabel} />
           </div>
-          {sidebarTracks.map((track) => (
-            <div key={track.id} className="flex-1 min-h-0">
-              <VideoTile stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />
-            </div>
-          ))}
+          {sidebarTracks.map((track) => {
+            // undefined (no signal received yet) must stay undefined, not
+            // collapse to false, so VideoTile falls back to the track-based
+            // heuristic instead of forcing "not muted"/"camera on".
+            const state = remoteMediaState?.get(track.peerID);
+            return (
+              <div key={track.id} className="flex-1 min-h-0">
+                <VideoTile
+                  stream={track.stream}
+                  label={`User ${track.peerID.slice(0, 6)}`}
+                  isMicMuted={state ? state.mic === false : undefined}
+                  isCamOff={state ? state.cam === false : undefined}
+                />
+              </div>
+            );
+          })}
         </div>
       </div>
     );
@@ -191,9 +222,18 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
     <div className="flex-1 p-6 h-[calc(100vh-80px)] flex items-center justify-center overflow-hidden">
       <div className={`grid ${gridClass} auto-rows-fr gap-4 w-full h-full justify-center items-stretch max-w-7xl`}>
         <VideoTile stream={localStream} label={localLabel} />
-        {uniqueTracks.map((track) => (
-          <VideoTile key={track.id} stream={track.stream} label={`User ${track.peerID.slice(0, 6)}`} />
-        ))}
+        {uniqueTracks.map((track) => {
+          const state = remoteMediaState?.get(track.peerID);
+          return (
+            <VideoTile
+              key={track.id}
+              stream={track.stream}
+              label={`User ${track.peerID.slice(0, 6)}`}
+              isMicMuted={state ? state.mic === false : undefined}
+              isCamOff={state ? state.cam === false : undefined}
+            />
+          );
+        })}
       </div>
     </div>
   );

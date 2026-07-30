@@ -7,6 +7,7 @@ export interface ParticipantTrack {
 
 export type TrackCallback = (track: ParticipantTrack) => void;
 export type MessageCallback = (msg: { sender: string; text: string; time: string }) => void;
+export type MediaStateCallback = (state: { peerId: string; kind: 'mic' | 'cam'; enabled: boolean }) => void;
 
 export class WebRTCService {
   private pc: RTCPeerConnection | null = null;
@@ -34,6 +35,8 @@ export class WebRTCService {
   public onTrackRemoved?: (trackId: string) => void;
   public onScreenShareEnded?: () => void;
   public onMessageReceived?: MessageCallback;
+  public onMediaStateChanged?: MediaStateCallback;
+  public onDisconnected?: () => void;
 
   constructor(private roomSlug: string) {}
 
@@ -182,6 +185,13 @@ export class WebRTCService {
       }
     };
 
+    this.ws.onclose = () => {
+      if (this.onDisconnected) this.onDisconnected();
+    };
+    this.ws.onerror = (err) => {
+      console.error('Signaling WebSocket error', err);
+    };
+
     this.ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
       if (msg.type === 'track_metadata') {
@@ -206,6 +216,22 @@ export class WebRTCService {
         }
         if (msg.kind === 'screen_stopped' && msg.stream_id && this.onTrackRemoved) {
           this.onTrackRemoved(msg.stream_id);
+        }
+        return;
+      }
+
+      if (msg.type === 'media_state') {
+        // onTrackAdded's peerID is actually the resolved peerName (see
+        // `peerID: peerName` below), not the raw peer_id — matching that
+        // same convention here is required, or lookups keyed by
+        // ParticipantTrack.peerID in VideoGrid would never match.
+        const peerId = msg.peer_name || msg.peer_id;
+        if (peerId && this.onMediaStateChanged) {
+          this.onMediaStateChanged({
+            peerId,
+            kind: msg.media_kind,
+            enabled: !!msg.enabled,
+          });
         }
         return;
       }
@@ -329,7 +355,15 @@ export class WebRTCService {
     }
   }
 
-
+  // Notifies other participants that this peer muted/unmuted its mic or
+  // turned its camera on/off. A sender toggling its own local track's
+  // `.enabled` produces no observable event on the corresponding remote
+  // track on other peers' PeerConnections, so this out-of-band message is
+  // the only way other participants' tiles can reflect it.
+  public sendMediaState(kind: 'mic' | 'cam', enabled: boolean): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'media_state', media_kind: kind, enabled }));
+  }
 
   // Chat is relayed by the SFU over the signaling WebSocket, not a
   // browser-to-browser RTCDataChannel: every client only ever has a

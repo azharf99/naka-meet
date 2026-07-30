@@ -44,6 +44,19 @@ services:
         condition: service_healthy
     networks:
       - naka_network
+    # Relative CPU priority under contention (enforced by plain
+    # docker-compose up via --cpu-shares; unlike deploy.resources
+    # reservations below, this is NOT a Swarm-only construct). Recording
+    # start launches a full Chromium + libx264 ffmpeg encode in
+    # egress-worker, which can otherwise starve this process's WS read/write
+    # loops for the whole room. 1024 vs egress-worker's 256 gives the SFU a
+    # 4:1 priority edge exactly when it matters.
+    cpu_shares: 1024
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
 
   frontend:
     image: azharfa/naka-meet-frontend:latest
@@ -71,6 +84,7 @@ services:
         condition: service_started
     networks:
       - naka_network
+    cpu_shares: 256
     deploy:
       resources:
         limits:

@@ -68,6 +68,8 @@ type Handler struct {
 	wsWriteWait  time.Duration
 	wsPongWait   time.Duration
 	wsPingPeriod time.Duration
+
+	allowedOrigins []string
 }
 
 func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte) *Handler {
@@ -76,22 +78,44 @@ func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte
 		rm:        rm,
 		router:    router,
 		jwtSecret: jwtSecret,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
-		},
 		conns:        make(map[string]map[string]*SafeConn),
 		connsByUser:  make(map[string]*SafeConn),
 		wsWriteWait:  10 * time.Second,
 		wsPongWait:   pongWait,
 		wsPingPeriod: (pongWait * 9) / 10,
 	}
+	h.upgrader = websocket.Upgrader{
+		CheckOrigin: h.isAllowedOrigin,
+	}
 	// Lets the router deliver a renegotiation offer to any peer (e.g. one
 	// that was deferred because the peer's signaling state wasn't stable
 	// when a track was published) without needing to know its room.
 	router.SetOfferSender(h.sendOfferToPeer)
 	return h
+}
+
+// SetAllowedOrigins configures the WS-upgrade/CORS origin allowlist
+// (typically derived from FRONTEND_URL). Without this, any website could
+// open a signaling WebSocket using a victim's browser session cookie
+// (CheckOrigin previously returned true unconditionally).
+func (h *Handler) SetAllowedOrigins(origins []string) {
+	h.allowedOrigins = origins
+}
+
+func (h *Handler) isAllowedOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// No Origin header means this isn't a browser cross-origin request
+		// (e.g. a same-process test dialing the raw socket, or a non-browser
+		// client) — nothing to check against.
+		return true
+	}
+	for _, o := range h.allowedOrigins {
+		if o == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // SetKeepaliveIntervalsForTesting overrides this Handler's WS keepalive
@@ -151,6 +175,20 @@ func (h *Handler) broadcastToRoom(roomSlug, senderID string, message []byte) {
 	}
 }
 
+// BroadcastRecordingState notifies every participant in a room that a
+// recording/RTMP stream started or stopped — server-triggered (from the
+// REST /rooms/:slug/live endpoint), so unlike track_metadata/media_state
+// this has no "sender" to exclude: everyone, including the host who
+// triggered it, needs the consent notice.
+func (h *Handler) BroadcastRecordingState(roomSlug string, active bool, kind string) {
+	msgBytes, _ := json.Marshal(map[string]interface{}{
+		"type":   "recording_state",
+		"active": active,
+		"kind":   kind,
+	})
+	h.broadcastToRoom(roomSlug, "", msgBytes)
+}
+
 func (h *Handler) AddTrackAndRenegotiate(roomSlug, publisherID string, track pion.TrackLocal) {
 	h.AddTrackAndRenegotiateWithMetadata(roomSlug, publisherID, "", "camera", track)
 }
@@ -160,11 +198,16 @@ func (h *Handler) AddTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publ
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Enable CORS for cross-origin frontend (Port 3000 -> 8080)
-	w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-	w.Header().Set("Access-Control-Allow-Credentials", "true")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Cookie")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	// CORS for cross-origin frontend, restricted to the configured allowlist
+	// (SetAllowedOrigins) — a blind Origin reflection combined with
+	// Allow-Credentials would let any website read credentialed responses
+	// from this endpoint using a victim's cookies.
+	if origin := r.Header.Get("Origin"); origin != "" && h.isAllowedOrigin(r) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Cookie")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	}
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)

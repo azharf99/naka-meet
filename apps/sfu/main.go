@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/naka-meet/sfu/pkg/api"
 	"github.com/naka-meet/sfu/pkg/db"
@@ -30,10 +31,30 @@ func main() {
 		port = "8080"
 	}
 
-	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
-	if len(jwtSecret) == 0 {
-		jwtSecret = []byte("nakameet-default-secret-key-12345")
+	jwtSecretStr := os.Getenv("JWT_SECRET")
+	if jwtSecretStr == "" {
+		// Fail closed: a well-known fallback secret checked into source
+		// would let anyone forge a host JWT for any room.
+		log.Fatal("JWT_SECRET environment variable is required and must not be empty")
 	}
+	jwtSecret := []byte(jwtSecretStr)
+
+	// ALLOWED_ORIGINS is the browser-facing origin allowlist for CORS and
+	// WS-upgrade checks — distinct from FRONTEND_URL (the container-internal
+	// address the egress worker uses to reach the frontend), since browsers
+	// never see that Docker-internal hostname. Defaults to the frontend's
+	// documented local dev/deploy port.
+	originsEnv := os.Getenv("ALLOWED_ORIGINS")
+	if originsEnv == "" {
+		originsEnv = "http://localhost:3000"
+	}
+	var allowedOrigins []string
+	for _, o := range strings.Split(originsEnv, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allowedOrigins = append(allowedOrigins, o)
+		}
+	}
+	secureCookies := os.Getenv("COOKIE_SECURE") == "true"
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
@@ -79,7 +100,14 @@ func main() {
 
 	// 3. Handlers
 	signalingHandler := signaling.NewHandler(rm, router, jwtSecret)
+	signalingHandler.SetAllowedOrigins(allowedOrigins)
+
 	apiHandler := api.NewAPIHandlerWithDeps(jwtSecret, &RedisPubWrapper{rdb: rdb}, rm, gormDB)
+	apiHandler.SetAllowedOrigins(allowedOrigins)
+	apiHandler.SetSecureCookies(secureCookies)
+	// So every participant (not just the host whose click triggered it) is
+	// notified when a recording/RTMP stream starts or stops.
+	apiHandler.SetRecordingBroadcaster(signalingHandler.BroadcastRecordingState)
 
 	mux := http.NewServeMux()
 

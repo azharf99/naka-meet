@@ -26,11 +26,23 @@ function resolveOutputPath(roomSlug, action, customUrl = '') {
 function buildFFmpegArgs(roomSlug, outputUrl = 'output.mp4', options = {}) {
 
   const display = process.env.DISPLAY || ':99';
-  const useDummyAudio = options.useDummyAudio !== undefined ? options.useDummyAudio : true;
+  // audioSource picks the ffmpeg audio input: 'pulse' captures real page
+  // audio from the PulseAudio null-sink Chromium's output is routed to
+  // (see start.sh), 'alsa' targets a hardware/ALSA default device, and
+  // 'dummy' produces silence (used by tests, and as a last-resort fallback
+  // if PulseAudio isn't available). useDummyAudio is kept for backward
+  // compatibility with existing callers/tests.
+  const audioSource = options.audioSource || (options.useDummyAudio ? 'dummy' : 'pulse');
+  const pulseSink = process.env.PULSE_SINK || 'egress_sink';
 
-  const audioInputArgs = useDummyAudio
-    ? ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
-    : ['-f', 'alsa', '-i', 'default'];
+  let audioInputArgs;
+  if (audioSource === 'dummy') {
+    audioInputArgs = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'];
+  } else if (audioSource === 'alsa') {
+    audioInputArgs = ['-f', 'alsa', '-i', 'default'];
+  } else {
+    audioInputArgs = ['-f', 'pulse', '-i', `${pulseSink}.monitor`];
+  }
 
   const isRTMP = outputUrl.startsWith('rtmp://') || outputUrl.startsWith('rtmps://');
   const formatArgs = isRTMP ? ['-f', 'flv'] : [];
@@ -145,7 +157,7 @@ class EgressWorker {
       console.warn('Puppeteer launch skipped or failed, proceeding with screen capture:', err.message);
     }
 
-    const args = buildFFmpegArgs(roomSlug, outputUrl, { useDummyAudio: true });
+    const args = buildFFmpegArgs(roomSlug, outputUrl, { audioSource: 'pulse' });
     console.log(`🎥 Launching FFmpeg recording for room ${roomSlug} -> ${outputUrl}`);
 
     this.ffmpegProcess = spawn('ffmpeg', args);

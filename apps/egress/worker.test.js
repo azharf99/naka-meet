@@ -13,6 +13,28 @@ test('buildFFmpegArgs handles local MP4 recording', () => {
   assert.strictEqual(args[args.length - 1], mp4Url);
 });
 
+test('buildFFmpegArgs captures real audio via PulseAudio monitor by default in production', () => {
+  const roomSlug = 'test-room';
+  const mp4Url = 'recording.mp4';
+  const args = buildFFmpegArgs(roomSlug, mp4Url, { audioSource: 'pulse' });
+
+  assert.ok(args.includes('pulse'), 'Should use pulse input format');
+  assert.ok(args.includes('egress_sink.monitor'), 'Should capture from the default egress sink monitor');
+  assert.ok(!args.includes('anullsrc=channel_layout=stereo:sample_rate=44100'), 'Should not use silent dummy audio');
+});
+
+test('buildFFmpegArgs honors PULSE_SINK env override for the monitor source', () => {
+  const originalSink = process.env.PULSE_SINK;
+  process.env.PULSE_SINK = 'custom_sink';
+  try {
+    const args = buildFFmpegArgs('test-room', 'recording.mp4', { audioSource: 'pulse' });
+    assert.ok(args.includes('custom_sink.monitor'), 'Should use the PULSE_SINK env var for the monitor source');
+  } finally {
+    if (originalSink === undefined) delete process.env.PULSE_SINK;
+    else process.env.PULSE_SINK = originalSink;
+  }
+});
+
 test('buildFFmpegArgs handles RTMP live stream with FLV format', () => {
   const roomSlug = 'test-room';
   const rtmpUrl = 'rtmp://a.rtmp.youtube.com/live2/key123';

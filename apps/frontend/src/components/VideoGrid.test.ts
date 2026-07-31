@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { getGridClass, deduplicateTracks, getInitials, deriveVisibility } from './VideoGrid';
+import { getGridClass, deduplicateTracks, getInitials, deriveVisibility, getTotalTileCount } from './VideoGrid';
 
 describe('VideoGrid Helper Tests', () => {
   test('getGridClass assigns dynamic layout based on total participant count', () => {
@@ -37,6 +37,18 @@ describe('VideoGrid Helper Tests', () => {
     expect(getInitials('Budi Ganteng')).toBe('BG');
     expect(getInitials('Azhar')).toBe('AZ');
     expect(getInitials('User (You)')).toBe('US');
+  });
+
+  describe('getTotalTileCount (egress shadow-tile fix)', () => {
+    test('counts a local self-tile for a normal participant', () => {
+      expect(getTotalTileCount(3, false)).toBe(4);
+      expect(getTotalTileCount(0, false)).toBe(1);
+    });
+
+    test('excludes the local self-tile for the headless egress recorder, which has no real camera', () => {
+      expect(getTotalTileCount(3, true)).toBe(3);
+      expect(getTotalTileCount(0, true)).toBe(0);
+    });
   });
 
   describe('deriveVisibility (mute/camera-off state)', () => {

@@ -205,6 +205,23 @@ describe('WebRTCService Audit & Unit Tests', () => {
 
     expect(received).toEqual({ peerId: 'user-uuid-2', kind: 'mic', enabled: true });
   });
+
+  test('incoming recording_state triggers onRecordingStateChanged for every participant', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let received: any = null;
+    service.onRecordingStateChanged = (state) => {
+      received = state;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({
+      data: JSON.stringify({ type: 'recording_state', active: true, kind: 'recording' }),
+    });
+
+    expect(received).toEqual({ active: true, kind: 'recording' });
+  });
 });
 
 

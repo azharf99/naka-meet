@@ -41,6 +41,15 @@ export function deduplicateTracks(remoteTracks: ParticipantTrack[]): Participant
   return Array.from(map.values());
 }
 
+// The egress recorder page (rendered headlessly by Puppeteer and captured
+// verbatim by FFmpeg — see App.tsx's `?role=egress` route) has no camera of
+// its own (getUserMedia fails under Xvfb), so its local self-tile is never a
+// real participant. Rendering it anyway produces an empty, permanently
+// mic-muted "shadow" tile in every recording.
+export function getTotalTileCount(remoteTrackCount: number, isEgress: boolean): number {
+  return isEgress ? remoteTrackCount : remoteTrackCount + 1;
+}
+
 export function getInitials(name: string): string {
   const clean = name.replace(/\(.*\)/, '').trim();
   if (!clean) return 'U';
@@ -173,6 +182,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
 }) => {
   const uniqueTracks = deduplicateTracks(remoteTracks);
   const remoteScreenTrack = uniqueTracks.find((t) => t.isScreenShare);
+  const isEgress = userRole === 'egress';
 
   const activePresentationStream = localScreenStream || remoteScreenTrack?.stream;
   const presentationLabel = localScreenStream ? 'Your Screen Presentation' : 'Presentation Screen';
@@ -191,9 +201,11 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
           <VideoTile stream={activePresentationStream} label={presentationLabel} isScreen />
         </div>
         <div className="flex flex-col gap-3 h-full min-h-0 overflow-hidden">
-          <div className="flex-1 min-h-0">
-            <VideoTile stream={localStream} label={localLabel} />
-          </div>
+          {!isEgress && (
+            <div className="flex-1 min-h-0">
+              <VideoTile stream={localStream} label={localLabel} />
+            </div>
+          )}
           {sidebarTracks.map((track) => {
             // undefined (no signal received yet) must stay undefined, not
             // collapse to false, so VideoTile falls back to the track-based
@@ -215,13 +227,13 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
     );
   }
 
-  const totalTiles = 1 + uniqueTracks.length; // Local participant tile is always rendered
+  const totalTiles = getTotalTileCount(uniqueTracks.length, isEgress);
   const gridClass = getGridClass(totalTiles);
 
   return (
     <div className="flex-1 p-6 h-[calc(100vh-80px)] flex items-center justify-center overflow-hidden">
       <div className={`grid ${gridClass} auto-rows-fr gap-4 w-full h-full justify-center items-stretch max-w-7xl`}>
-        <VideoTile stream={localStream} label={localLabel} />
+        {!isEgress && <VideoTile stream={localStream} label={localLabel} />}
         {uniqueTracks.map((track) => {
           const state = remoteMediaState?.get(track.peerID);
           return (

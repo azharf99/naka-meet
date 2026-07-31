@@ -106,6 +106,21 @@ func (rm *RoomManager) AddParticipant(ctx context.Context, slug string, p *Parti
 	return nil
 }
 
+// GetRoomHostID returns the room's recorded HostID (the ID passed to
+// CreateOrGetRoom when the room was first created) so callers can enforce
+// host-only actions against actual room ownership instead of trusting a
+// caller's self-declared "host" role claim in isolation.
+func (rm *RoomManager) GetRoomHostID(slug string) (string, bool) {
+	rm.rooms.RLock()
+	defer rm.rooms.RUnlock()
+
+	r, exists := rm.rooms.m[slug]
+	if !exists {
+		return "", false
+	}
+	return r.HostID, true
+}
+
 func (rm *RoomManager) GetParticipant(slug string, participantID string) (*Participant, bool) {
 	rm.rooms.RLock()
 	r, exists := rm.rooms.m[slug]

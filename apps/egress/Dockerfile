@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     libappindicator3-1 \
     xdg-utils \
+    pulseaudio \
+    pulseaudio-utils \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
@@ -26,12 +28,6 @@ RUN npm install
 COPY . .
 
 RUN mkdir -p recordings
-
-
-RUN echo '#!/bin/bash\n\
-Xvfb :99 -screen 0 1920x1080x24 -ac & \n\
-sleep 2\n\
-node worker.js' > /usr/src/app/start.sh
 
 RUN chmod +x /usr/src/app/start.sh
 

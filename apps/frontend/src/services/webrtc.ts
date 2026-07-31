@@ -8,6 +8,7 @@ export interface ParticipantTrack {
 export type TrackCallback = (track: ParticipantTrack) => void;
 export type MessageCallback = (msg: { sender: string; text: string; time: string }) => void;
 export type MediaStateCallback = (state: { peerId: string; kind: 'mic' | 'cam'; enabled: boolean }) => void;
+export type RecordingStateCallback = (state: { active: boolean; kind: string }) => void;
 
 export class WebRTCService {
   private pc: RTCPeerConnection | null = null;
@@ -36,6 +37,7 @@ export class WebRTCService {
   public onScreenShareEnded?: () => void;
   public onMessageReceived?: MessageCallback;
   public onMediaStateChanged?: MediaStateCallback;
+  public onRecordingStateChanged?: RecordingStateCallback;
   public onDisconnected?: () => void;
 
   constructor(private roomSlug: string) {}
@@ -232,6 +234,17 @@ export class WebRTCService {
             kind: msg.media_kind,
             enabled: !!msg.enabled,
           });
+        }
+        return;
+      }
+
+      if (msg.type === 'recording_state') {
+        // Server-triggered (from the host's REST call, not this peer's own
+        // WS connection) and broadcast to every participant — including the
+        // host — so everyone gets the on-screen consent notice, not just
+        // whoever clicked the button.
+        if (this.onRecordingStateChanged) {
+          this.onRecordingStateChanged({ active: !!msg.active, kind: msg.kind || '' });
         }
         return;
       }

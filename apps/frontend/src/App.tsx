@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { WebRTCService, ParticipantTrack } from './services/webrtc';
-import { loginUser, createRoom } from './services/auth';
+import { guestJoin, getSession, logout } from './services/auth';
 import { VideoGrid } from './components/VideoGrid';
 import { Controls } from './components/Controls';
-import { Lobby } from './components/Lobby';
-import { Send, X, ShieldCheck, UserCheck } from 'lucide-react';
+import { Lobby, HostSession } from './components/Lobby';
+import { Send, X, ShieldCheck, UserCheck, LogOut } from 'lucide-react';
 
 export const App: React.FC = () => {
   const urlParams = new URLSearchParams(window.location.search);
@@ -22,6 +22,7 @@ export const App: React.FC = () => {
   const [remoteTracks, setRemoteTracks] = useState<ParticipantTrack[]>([]);
   const [remoteMediaState, setRemoteMediaState] = useState<Map<string, { mic: boolean; cam: boolean }>>(new Map());
   const [connectionLost, setConnectionLost] = useState(false);
+  const [recordingConsent, setRecordingConsent] = useState<{ active: boolean; kind: string } | null>(null);
 
   const [chatOpen, setChatOpen] = useState(false);
   const [messages, setMessages] = useState<Array<{ sender: string; text: string; time: string }>>([]);
@@ -30,11 +31,12 @@ export const App: React.FC = () => {
   const [isLiveStreaming, setIsLiveStreaming] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
 
-
+  const [restoredHostSession, setRestoredHostSession] = useState<HostSession | null>(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
 
   const handleJoinRoom = async (name: string, targetRoomSlug: string, role: string) => {
     try {
-      const authData = await loginUser(name, role);
+      const authData = await guestJoin(name, targetRoomSlug, role);
       setToken(authData.token);
       setUserRole(authData.role || role);
       setDisplayName(name);
@@ -47,23 +49,38 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleCreateRoom = async (name: string, customRoomSlug: string) => {
-    try {
-      const authData = await loginUser(name, 'host');
-      const roomData = await createRoom(customRoomSlug, authData.token);
-      const activeSlug = roomData.room.slug;
-
-      setToken(authData.token);
-      setUserRole('host');
-      setDisplayName(name);
-      setRoomSlug(activeSlug);
-      setInMeeting(true);
-      window.history.pushState({}, '', `?room=${encodeURIComponent(activeSlug)}`);
-    } catch (err) {
-      console.error('Failed to create room', err);
-      alert('Failed to create room. Please check backend connection.');
-    }
+  // Called by Lobby once a host has authenticated (login/signup, or a
+  // restored cookie session) AND the room has already been created — auth
+  // and room-ownership are Lobby's concern, App just enters the meeting.
+  const handleEnterAsHost = (session: HostSession, activeSlug: string) => {
+    setToken(session.token);
+    setUserRole(session.role || 'host');
+    setDisplayName(session.name);
+    setRoomSlug(activeSlug);
+    setInMeeting(true);
+    window.history.pushState({}, '', `?room=${encodeURIComponent(activeSlug)}`);
   };
+
+  // Restores a host session from the httpOnly cookie so a returning host
+  // doesn't have to re-enter credentials after a reload.
+  useEffect(() => {
+    const roleParam = urlParams.get('role');
+    if (roleParam === 'egress') {
+      setSessionChecked(true);
+      return;
+    }
+    getSession().then((session) => {
+      if (session && session.role === 'host') {
+        // /auth/me deliberately doesn't return the raw JWT (it only proves
+        // the httpOnly cookie is valid) — leave token empty. Every request
+        // that follows uses credentials:'include', and the backend already
+        // prefers the cookie over an empty/missing Bearer header, so this
+        // still authenticates correctly for both REST and the WS handshake.
+        setRestoredHostSession({ token: '', name: session.name, role: session.role });
+      }
+      setSessionChecked(true);
+    });
+  }, []);
 
   useEffect(() => {
     const roleParam = urlParams.get('role');
@@ -141,6 +158,13 @@ export const App: React.FC = () => {
           setConnectionLost(true);
         };
 
+        // Server-triggered broadcast (from the host's REST call, not this
+        // peer's own click) — every participant, host included, needs the
+        // on-screen recording-consent notice, not just whoever clicked.
+        service.onRecordingStateChanged = ({ active, kind }) => {
+          setRecordingConsent(active ? { active, kind } : null);
+        };
+
         await service.connectToken(token);
         setConnectionLost(false);
         setLocalStream(service.getLocalStream());
@@ -200,11 +224,15 @@ export const App: React.FC = () => {
 
 
   if (!inMeeting) {
+    if (!sessionChecked) {
+      return <div className="min-h-screen w-full bg-slate-950" />;
+    }
     return (
       <Lobby
         initialRoomSlug={initialRoomFromUrl}
+        initialHostSession={restoredHostSession}
         onJoinRoom={handleJoinRoom}
-        onCreateRoom={handleCreateRoom}
+        onEnterAsHost={handleEnterAsHost}
       />
     );
   }
@@ -236,6 +264,19 @@ export const App: React.FC = () => {
           <span className="px-3 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-full text-xs font-medium flex items-center gap-1.5">
             <ShieldCheck className="w-3.5 h-3.5" /> WebRTC SFU Active
           </span>
+          {userRole === 'host' && (
+            <button
+              onClick={() => {
+                logout();
+                setRestoredHostSession(null);
+                handleLeaveRoom();
+              }}
+              className="p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 rounded-full transition-colors"
+              title="Log out"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </header>
 
@@ -250,11 +291,20 @@ export const App: React.FC = () => {
           remoteMediaState={remoteMediaState}
         />
 
-        {connectionLost && (
-          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-red-500/90 text-white text-xs font-medium rounded-lg shadow-lg backdrop-blur-md">
-            Connection lost — please reload to rejoin.
-          </div>
-        )}
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2">
+          {connectionLost && (
+            <div className="px-4 py-2 bg-red-500/90 text-white text-xs font-medium rounded-lg shadow-lg backdrop-blur-md">
+              Connection lost — please reload to rejoin.
+            </div>
+          )}
+
+          {recordingConsent?.active && (
+            <div className="px-4 py-2 bg-red-600/90 text-white text-xs font-semibold rounded-lg shadow-lg backdrop-blur-md flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+              This meeting is being {recordingConsent.kind === 'rtmp' ? 'live streamed' : 'recorded'}.
+            </div>
+          )}
+        </div>
 
         {/* Real-time Chat Drawer (relayed by the SFU over the signaling WebSocket) */}
         {chatOpen && (

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, Video, ArrowRight, AlertCircle } from 'lucide-react';
+import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, Video, ArrowRight, AlertCircle, UserPlus, LogOut } from 'lucide-react';
+import { login, signup, createRoom, logout, SessionResponse } from '../services/auth';
 
 export function validateJoinInput(name: string, roomSlug: string): { valid: boolean; error?: string } {
   if (!name.trim()) return { valid: false, error: 'Display name is required' };
@@ -11,22 +12,29 @@ export function shouldAutoJoinEgress(role: string, roomSlug: string): boolean {
   return role === 'egress' && !!roomSlug.trim();
 }
 
+export type HostSession = Pick<SessionResponse, 'token' | 'name' | 'role'>;
 
 interface LobbyProps {
   initialRoomSlug?: string;
+  initialHostSession?: HostSession | null;
   onJoinRoom: (name: string, roomSlug: string, role: string) => void;
-  onCreateRoom: (name: string, roomSlug: string) => void;
+  onEnterAsHost: (session: HostSession, roomSlug: string) => void;
 }
 
 
-export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', onJoinRoom, onCreateRoom }) => {
+export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostSession = null, onJoinRoom, onEnterAsHost }) => {
   const [guestName, setGuestName] = useState('');
   const [guestRoomSlug, setGuestRoomSlug] = useState(initialRoomSlug || 'demo-room');
   const [guestError, setGuestError] = useState('');
 
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [hostSession, setHostSession] = useState<HostSession | null>(initialHostSession);
   const [hostName, setHostName] = useState('');
+  const [hostEmail, setHostEmail] = useState('');
+  const [hostPassword, setHostPassword] = useState('');
   const [hostRoomSlug, setHostRoomSlug] = useState('');
   const [hostError, setHostError] = useState('');
+  const [hostBusy, setHostBusy] = useState(false);
 
   const handleGuestJoin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -39,14 +47,42 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', onJoinRoom, 
     onJoinRoom(guestName.trim(), guestRoomSlug.trim(), 'guest');
   };
 
-  const handleHostCreate = (e: React.FormEvent) => {
+  const handleHostAuth = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!hostName.trim()) {
-      setHostError('Host display name is required');
-      return;
-    }
     setHostError('');
-    onCreateRoom(hostName.trim(), hostRoomSlug.trim());
+    setHostBusy(true);
+    try {
+      const session =
+        authMode === 'signup'
+          ? await signup(hostName.trim(), hostEmail.trim(), hostPassword)
+          : await login(hostEmail.trim(), hostPassword);
+      setHostSession(session);
+    } catch (err) {
+      setHostError(err instanceof Error ? err.message : 'Authentication failed');
+    } finally {
+      setHostBusy(false);
+    }
+  };
+
+  const handleHostCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!hostSession) return;
+    setHostError('');
+    setHostBusy(true);
+    try {
+      const roomData = await createRoom(hostRoomSlug.trim(), hostSession.token);
+      onEnterAsHost(hostSession, roomData.room.slug);
+    } catch (err) {
+      setHostError(err instanceof Error ? err.message : 'Failed to create room');
+      setHostBusy(false);
+    }
+  };
+
+  const handleHostLogout = async () => {
+    await logout();
+    setHostSession(null);
+    setHostEmail('');
+    setHostPassword('');
   };
 
   return (
@@ -146,9 +182,13 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', onJoinRoom, 
                 Host Authority
               </span>
             </div>
-            <h2 className="text-xl font-bold text-white mb-2">Create or Manage Room</h2>
+            <h2 className="text-xl font-bold text-white mb-2">
+              {hostSession ? `Welcome, ${hostSession.name}` : 'Host Sign In'}
+            </h2>
             <p className="text-slate-400 text-xs leading-relaxed mb-6">
-              Enter as Host to establish new rooms with full authority over Egress recording, RTMP streaming, and room moderation.
+              {hostSession
+                ? 'Create or rejoin a room with full authority over Egress recording and RTMP streaming.'
+                : 'A real account is required to host — hosting authority is tied to who you are, not a self-declared role.'}
             </p>
 
             {hostError && (
@@ -158,38 +198,94 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', onJoinRoom, 
               </div>
             )}
 
-            <form onSubmit={handleHostCreate} className="space-y-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1.5">Host Name</label>
-                <input
-                  type="text"
-                  value={hostName}
-                  onChange={(e) => setHostName(e.target.value)}
-                  placeholder="e.g. Azhar (Instructor)"
-                  className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition-colors"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                  Custom Room Slug <span className="text-slate-500 font-normal">(Optional, leave blank to generate)</span>
-                </label>
-                <input
-                  type="text"
-                  value={hostRoomSlug}
-                  onChange={(e) => setHostRoomSlug(e.target.value)}
-                  placeholder="e.g. masterclass-golang"
-                  className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 font-mono transition-colors"
-                />
-              </div>
-              <button
-                type="submit"
-                className="w-full mt-2 py-3.5 px-6 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white rounded-xl font-semibold text-xs transition-all duration-200 shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 group-hover:scale-[1.01]"
-              >
-                <PlusCircle className="w-4 h-4" />
-                <span>Create & Join as Host</span>
-                <ArrowRight className="w-4 h-4 ml-1" />
-              </button>
-            </form>
+            {hostSession ? (
+              <form onSubmit={handleHostCreate} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                    Custom Room Slug <span className="text-slate-500 font-normal">(Optional, leave blank to generate)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={hostRoomSlug}
+                    onChange={(e) => setHostRoomSlug(e.target.value)}
+                    placeholder="e.g. masterclass-golang"
+                    className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 font-mono transition-colors"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={hostBusy}
+                  className="w-full mt-2 py-3.5 px-6 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white rounded-xl font-semibold text-xs transition-all duration-200 shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 group-hover:scale-[1.01] disabled:opacity-60"
+                >
+                  <PlusCircle className="w-4 h-4" />
+                  <span>{hostBusy ? 'Creating…' : 'Create & Join as Host'}</span>
+                  <ArrowRight className="w-4 h-4 ml-1" />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleHostLogout}
+                  className="w-full py-2 text-[11px] text-slate-500 hover:text-slate-300 flex items-center justify-center gap-1.5"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  Not you? Log out
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleHostAuth} className="space-y-4">
+                {authMode === 'signup' && (
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1.5">Host Name</label>
+                    <input
+                      type="text"
+                      value={hostName}
+                      onChange={(e) => setHostName(e.target.value)}
+                      placeholder="e.g. Azhar (Instructor)"
+                      className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition-colors"
+                    />
+                  </div>
+                )}
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5">Email</label>
+                  <input
+                    type="email"
+                    value={hostEmail}
+                    onChange={(e) => setHostEmail(e.target.value)}
+                    placeholder="you@example.com"
+                    className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition-colors"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5">Password</label>
+                  <input
+                    type="password"
+                    value={hostPassword}
+                    onChange={(e) => setHostPassword(e.target.value)}
+                    placeholder={authMode === 'signup' ? 'At least 8 characters' : '••••••••'}
+                    className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 transition-colors"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={hostBusy}
+                  className="w-full mt-2 py-3.5 px-6 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white rounded-xl font-semibold text-xs transition-all duration-200 shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 group-hover:scale-[1.01] disabled:opacity-60"
+                >
+                  {authMode === 'signup' ? <UserPlus className="w-4 h-4" /> : <LogIn className="w-4 h-4" />}
+                  <span>
+                    {hostBusy ? 'Please wait…' : authMode === 'signup' ? 'Sign Up' : 'Log In'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode(authMode === 'signup' ? 'login' : 'signup');
+                    setHostError('');
+                  }}
+                  className="w-full py-1 text-[11px] text-slate-400 hover:text-slate-200"
+                >
+                  {authMode === 'signup' ? 'Already have an account? Log in' : "Don't have an account? Sign up"}
+                </button>
+              </form>
+            )}
           </div>
         </div>
       </div>

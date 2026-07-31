@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -47,4 +49,39 @@ func InitDB(dsn string) (*gorm.DB, error) {
 	}
 
 	return database, nil
+}
+
+var (
+	ErrUserNotFound = errors.New("user not found")
+)
+
+// UserStore abstracts persistence of host accounts so the API layer can be
+// unit-tested (via an in-memory fake) without a real Postgres connection.
+// GormUserStore is the production implementation backed by *gorm.DB.
+type UserStore interface {
+	CreateUser(ctx context.Context, u *User) error
+	FindUserByEmail(ctx context.Context, email string) (*User, error)
+}
+
+type GormUserStore struct {
+	db *gorm.DB
+}
+
+func NewGormUserStore(db *gorm.DB) *GormUserStore {
+	return &GormUserStore{db: db}
+}
+
+func (s *GormUserStore) CreateUser(ctx context.Context, u *User) error {
+	return s.db.WithContext(ctx).Create(u).Error
+}
+
+func (s *GormUserStore) FindUserByEmail(ctx context.Context, email string) (*User, error) {
+	var u User
+	if err := s.db.WithContext(ctx).Where("email = ?", email).First(&u).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return &u, nil
 }

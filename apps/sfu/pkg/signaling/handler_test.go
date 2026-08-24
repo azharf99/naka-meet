@@ -264,16 +264,17 @@ func TestSignaling_SDPOfferAnswerExchange(t *testing.T) {
 	}
 	require.NoError(t, ws.WriteJSON(offerMsg))
 
-	// Expect SDP answer back from SFU handler
-	var ansMsg struct {
-		Type string `json:"type"`
-		SDP  string `json:"sdp"`
-	}
-	require.NoError(t, ws.SetReadDeadline(time.Now().Add(2*time.Second)))
-	err = ws.ReadJSON(&ansMsg)
-	require.NoError(t, err, "SFU should reply with SDP answer")
-	assert.Equal(t, "answer", ansMsg.Type)
-	assert.NotEmpty(t, ansMsg.SDP)
+	// Expect SDP answer back from SFU handler. The very first message on the
+	// wire isn't guaranteed to be the answer: pc.OnICECandidate on the server
+	// side writes trickled "candidate" messages from its own goroutine,
+	// independent of the message loop that writes "answer" - so it can land
+	// before, after, or between them (see the sibling tests below that hit
+	// this same flakiness). Loop past any candidates instead of assuming a
+	// fixed position.
+	msg := readUntilType(t, ws, "answer", 2*time.Second)
+	require.NotNil(t, msg, "SFU should reply with SDP answer, possibly interleaved with trickled ICE candidates")
+	assert.Equal(t, "answer", msg["type"])
+	assert.NotEmpty(t, msg["sdp"])
 }
 
 func TestSignaling_RenegotiationOfferOnNewTrack(t *testing.T) {

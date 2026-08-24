@@ -8,6 +8,8 @@
     "test:headed": "playwright test --headed"
   },
   "devDependencies": {
-    "@playwright/test": "^1.62.1"
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^22.13.0",
+    "ioredis": "^6.0.0"
   }
 }

@@ -108,6 +108,10 @@ func main() {
 	// So every participant (not just the host whose click triggered it) is
 	// notified when a recording/RTMP stream starts or stops.
 	apiHandler.SetRecordingBroadcaster(signalingHandler.BroadcastRecordingState)
+	// So the host-only "remove participant" REST endpoint can actually
+	// disconnect someone — apiHandler only owns RoomManager bookkeeping, not
+	// the live WebSocket connections signalingHandler holds.
+	apiHandler.SetParticipantRemover(signalingHandler.RemoveParticipant)
 
 	mux := http.NewServeMux()
 

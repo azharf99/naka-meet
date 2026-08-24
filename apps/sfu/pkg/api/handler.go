@@ -44,6 +44,14 @@ type APIHandler struct {
 	// stream started or stopped, for on-screen consent notice.
 	recordingBroadcast func(roomSlug string, active bool, kind string)
 
+	// participantRemover, when set, actually disconnects a participant
+	// (typically signaling.Handler.RemoveParticipant) — this package has no
+	// direct reference to the live WebSocket connections or PeerConnections,
+	// only to RoomManager's bookkeeping, so the REST handler below delegates
+	// the actual removal to whoever owns those. Returns false if the
+	// participant wasn't found connected to that room.
+	participantRemover func(roomSlug, participantID, reason string) bool
+
 	authLimiters  map[string]*rate.Limiter
 	authLimiterMu sync.Mutex
 }
@@ -87,6 +95,14 @@ func (h *APIHandler) SetSecureCookies(secure bool) {
 // button — learns a recording/RTMP stream started or stopped.
 func (h *APIHandler) SetRecordingBroadcaster(fn func(roomSlug string, active bool, kind string)) {
 	h.recordingBroadcast = fn
+}
+
+// SetParticipantRemover wires a callback (typically
+// signaling.Handler.RemoveParticipant) so the host-only "remove
+// participant" endpoint below can actually disconnect someone, not just
+// update RoomManager's bookkeeping.
+func (h *APIHandler) SetParticipantRemover(fn func(roomSlug, participantID, reason string) bool) {
+	h.participantRemover = fn
 }
 
 // SetUserStoreForTesting overrides the user store (e.g. with an in-memory
@@ -226,6 +242,13 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 7. Room Egress Endpoint: /api/v1/rooms/:slug/live
 	if strings.HasPrefix(path, "/api/v1/rooms/") && strings.HasSuffix(path, "/live") && r.Method == http.MethodPost {
 		h.handleEgressTrigger(w, r)
+		return
+	}
+
+	// 7b. Remove Participant Endpoint (host-only, moderation):
+	// /api/v1/rooms/:slug/participants/:id/remove
+	if strings.HasPrefix(path, "/api/v1/rooms/") && strings.HasSuffix(path, "/remove") && strings.Contains(path, "/participants/") && r.Method == http.MethodPost {
+		h.handleRemoveParticipant(w, r)
 		return
 	}
 
@@ -510,6 +533,50 @@ func (h *APIHandler) handleEgressTrigger(w http.ResponseWriter, r *http.Request)
 		"status": "egress_triggered",
 		"action": action,
 		"room":   roomSlug,
+	})
+}
+
+// handleRemoveParticipant is the moderation "kick" endpoint (BR1: host
+// authority over other participants). Host-only and, via isRoomHost,
+// scoped to that room's actual owner — not merely any caller holding a
+// JWT that self-declares role:"host".
+func (h *APIHandler) handleRemoveParticipant(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/rooms/")
+	trimmed = strings.TrimSuffix(trimmed, "/remove")
+	parts := strings.SplitN(trimmed, "/participants/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.Error(w, "Bad Request: expected /rooms/:slug/participants/:id/remove", http.StatusBadRequest)
+		return
+	}
+	roomSlug, participantID := parts[0], parts[1]
+
+	claims := h.extractAndValidateToken(r)
+	if !h.isRoomHost(claims, roomSlug) {
+		http.Error(w, "Forbidden: Host authority required for this room", http.StatusForbidden)
+		return
+	}
+
+	// A host targeting their own ID would just disconnect themselves via a
+	// confusing side door — the "Leave" control already covers that.
+	if participantID == claims.UserID {
+		http.Error(w, "Bad Request: use Leave to disconnect yourself", http.StatusBadRequest)
+		return
+	}
+
+	removed := false
+	if h.participantRemover != nil {
+		removed = h.participantRemover(roomSlug, participantID, "host_removed")
+	}
+	if !removed {
+		http.Error(w, "Participant not found in this room", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":         "participant_removed",
+		"room":           roomSlug,
+		"participant_id": participantID,
 	})
 }
 

@@ -206,6 +206,54 @@ describe('WebRTCService Audit & Unit Tests', () => {
     expect(received).toEqual({ peerId: 'user-uuid-2', kind: 'mic', enabled: true });
   });
 
+  test('incoming peer_stale prefers peer_name over peer_id, matching media_state convention', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let received: any = null;
+    service.onPeerStaleChanged = (state) => {
+      received = state;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({
+      data: JSON.stringify({
+        type: 'peer_stale',
+        peer_id: 'user-uuid-3',
+        peer_name: 'Charlie',
+        kind: 'camera',
+        stale: true,
+      }),
+    });
+
+    expect(received).toEqual({ peerId: 'Charlie', kind: 'camera', stale: true });
+  });
+
+  test('incoming removed message triggers onRemoved and suppresses the generic onDisconnected on close', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let removedReason: string | null = null;
+    let disconnectedCalled = false;
+    service.onRemoved = (reason) => {
+      removedReason = reason;
+    };
+    service.onDisconnected = () => {
+      disconnectedCalled = true;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({
+      data: JSON.stringify({ type: 'removed', reason: 'host_removed' }),
+    });
+    expect(removedReason).toBe('host_removed');
+
+    // The server closes the socket right after sending "removed" — that
+    // close must not also trigger the generic disconnected banner.
+    if (ws.onclose) ws.onclose();
+    expect(disconnectedCalled).toBe(false);
+  });
+
   test('incoming recording_state triggers onRecordingStateChanged for every participant', async () => {
     const service = new WebRTCService('demo-room');
     await service.connectToken('mock-jwt-token');

@@ -1,11 +1,13 @@
 package signaling
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -69,6 +71,18 @@ type Handler struct {
 	wsPongWait   time.Duration
 	wsPingPeriod time.Duration
 
+	// RTP-liveness thresholds, per-Handler for the same testability reason
+	// as the WS keepalive intervals above. A publisher's track forwarding
+	// goroutine only errors out when the underlying track/connection
+	// genuinely closes — it never notices a peer whose media pipeline has
+	// stalled while the PeerConnection itself still looks connected (a
+	// frozen tile that never recovers). rtpStaleAfter is how long a track
+	// can go silent before it's flagged stale (peer_stale broadcast);
+	// rtpAutoRemoveAfterStale is how much longer a continuously-stale track
+	// gets before that participant is force-removed from the room.
+	rtpStaleAfter           time.Duration
+	rtpAutoRemoveAfterStale time.Duration
+
 	allowedOrigins []string
 }
 
@@ -78,11 +92,13 @@ func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte
 		rm:        rm,
 		router:    router,
 		jwtSecret: jwtSecret,
-		conns:        make(map[string]map[string]*SafeConn),
-		connsByUser:  make(map[string]*SafeConn),
-		wsWriteWait:  10 * time.Second,
-		wsPongWait:   pongWait,
-		wsPingPeriod: (pongWait * 9) / 10,
+		conns:                   make(map[string]map[string]*SafeConn),
+		connsByUser:             make(map[string]*SafeConn),
+		wsWriteWait:             10 * time.Second,
+		wsPongWait:              pongWait,
+		wsPingPeriod:            (pongWait * 9) / 10,
+		rtpStaleAfter:           8 * time.Second,
+		rtpAutoRemoveAfterStale: 45 * time.Second,
 	}
 	h.upgrader = websocket.Upgrader{
 		CheckOrigin: h.isAllowedOrigin,
@@ -131,6 +147,15 @@ func (h *Handler) SetKeepaliveIntervalsForTesting(ping, pong time.Duration) {
 	h.wsWriteWait = ping
 	h.wsPongWait = pong
 	h.wsPingPeriod = ping
+}
+
+// SetLivenessThresholdsForTesting overrides this Handler's RTP-staleness
+// detection thresholds. Test-only; call before any tracks are published on
+// this Handler, since each track's watchdog goroutine captures the values
+// when it starts.
+func (h *Handler) SetLivenessThresholdsForTesting(staleAfter, autoRemoveAfterStale time.Duration) {
+	h.rtpStaleAfter = staleAfter
+	h.rtpAutoRemoveAfterStale = autoRemoveAfterStale
 }
 
 func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) {
@@ -193,6 +218,110 @@ func (h *Handler) BroadcastRecordingState(roomSlug string, active bool, kind str
 		"kind":   kind,
 	})
 	h.broadcastToRoom(roomSlug, "", msgBytes)
+}
+
+// RemoveParticipant forcibly disconnects participantID from roomSlug: it
+// sends a "removed" message (so the client can show why, distinct from a
+// generic connection drop) and closes its WebSocket. reason is relayed to
+// the removed client as-is ("host_removed" from the REST endpoint below, or
+// "stale_timeout" from the RTP-liveness watchdog in OnTrack). Returns false
+// if participantID isn't currently connected to this room on this Handler —
+// scoped to roomSlug specifically (not the flat connsByUser map) so a host
+// can never target a participant ID that isn't actually in the room they
+// have authority over.
+//
+// Removal is immediate rather than going through the normal 15s
+// reconnect-grace path: closing the WebSocket alone would still leave
+// RemoveParticipant's usual defer chain (HandleDisconnect) starting that
+// grace timer, which is right for an ordinary network drop but wrong for an
+// explicit kick — a removed participant shouldn't be able to quietly
+// rejoin by reconnecting within 15s. Removing them from the RoomManager
+// here first makes that deferred HandleDisconnect call a no-op (the
+// participant it looks up is already gone).
+//
+// This is a moderation primitive, not a ban: nothing here revokes the
+// removed participant's JWT, so a fresh join with the same token still
+// succeeds. A real "don't let this person back in" guarantee would need an
+// explicit per-room block list, which is out of scope for this pass.
+func (h *Handler) RemoveParticipant(roomSlug, participantID, reason string) bool {
+	h.mu.RLock()
+	var conn *SafeConn
+	if roomConns, exists := h.conns[roomSlug]; exists {
+		conn = roomConns[participantID]
+	}
+	h.mu.RUnlock()
+	if conn == nil {
+		return false
+	}
+
+	msgBytes, _ := json.Marshal(map[string]interface{}{
+		"type":   "removed",
+		"reason": reason,
+	})
+	_ = conn.WriteMessage(websocket.TextMessage, msgBytes)
+
+	h.rm.RemoveParticipant(context.Background(), roomSlug, participantID)
+
+	_ = conn.Close()
+	return true
+}
+
+// broadcastPeerStale notifies every participant in a room that a
+// publisher's track has gone silent (stale: true) or has recovered
+// (stale: false), driven by the RTP-liveness watchdog started in OnTrack.
+// Like BroadcastRecordingState, this is server-triggered with no single
+// "sender" to exclude.
+func (h *Handler) broadcastPeerStale(roomSlug, peerID, peerName, kind string, stale bool) {
+	msgBytes, _ := json.Marshal(map[string]interface{}{
+		"type":      "peer_stale",
+		"peer_id":   peerID,
+		"peer_name": peerName,
+		"kind":      kind,
+		"stale":     stale,
+	})
+	h.broadcastToRoom(roomSlug, "", msgBytes)
+}
+
+// watchTrackLiveness polls lastPacketNano (updated by OnTrack's RTP
+// forwarding goroutine on every packet) and drives peer_stale broadcasts
+// and auto-removal via the pure nextLivenessTick decision function. It
+// exits when done is closed (the forwarding goroutine's track/connection
+// genuinely closed) — if this track was left marked stale, that's cleared
+// so a peer who's already gone doesn't leave a stray "reconnecting" badge
+// behind.
+func (h *Handler) watchTrackLiveness(roomSlug, peerID, peerName, kind string, lastPacketNano *atomic.Int64, done <-chan struct{}) {
+	staleAfter := h.rtpStaleAfter
+	autoRemoveAfter := h.rtpAutoRemoveAfterStale
+	// Poll at twice the detection resolution so a stall is flagged reasonably
+	// promptly after crossing staleAfter, not up to a full staleAfter late.
+	ticker := time.NewTicker(staleAfter / 2)
+	defer ticker.Stop()
+
+	var state livenessState
+	for {
+		select {
+		case <-done:
+			if state.stale {
+				h.broadcastPeerStale(roomSlug, peerID, peerName, kind, false)
+			}
+			return
+		case <-ticker.C:
+			now := time.Now()
+			silentFor := now.Sub(time.Unix(0, lastPacketNano.Load()))
+			next, action := nextLivenessTick(now, silentFor, staleAfter, autoRemoveAfter, state)
+			state = next
+			switch action {
+			case livenessBecameStale:
+				h.broadcastPeerStale(roomSlug, peerID, peerName, kind, true)
+			case livenessRecovered:
+				h.broadcastPeerStale(roomSlug, peerID, peerName, kind, false)
+			case livenessShouldRemove:
+				log.Printf("watchTrackLiveness: auto-removing %s (%s) from room %s after %s of no RTP on a %s track", peerID, peerName, roomSlug, autoRemoveAfter, kind)
+				h.RemoveParticipant(roomSlug, peerID, "stale_timeout")
+				return
+			}
+		}
+	}
 }
 
 func (h *Handler) AddTrackAndRenegotiate(roomSlug, publisherID string, track pion.TrackLocal) {
@@ -360,18 +489,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Forward RTP Packets in Goroutine
+		var lastPacketNano atomic.Int64
+		lastPacketNano.Store(time.Now().UnixNano())
+		forwardDone := make(chan struct{})
 		go func(remote *pion.TrackRemote, local *pion.TrackLocalStaticRTP) {
+			defer close(forwardDone)
 			buf := make([]byte, 1500)
 			for {
 				i, _, readErr := remote.Read(buf)
 				if readErr != nil {
 					break
 				}
+				lastPacketNano.Store(time.Now().UnixNano())
 				if _, writeErr := local.Write(buf[:i]); writeErr != nil {
 					break
 				}
 			}
 		}(remoteTrack, localTrack)
+
+		// remote.Read above blocks indefinitely and only ever errors once the
+		// track/connection genuinely closes — it never notices a publisher
+		// whose media pipeline has stalled while the PeerConnection itself
+		// still looks connected, which is exactly a frozen tile that never
+		// recovers on its own. Poll the last-packet timestamp instead so
+		// every other participant sees a "reconnecting" state and, if the
+		// stall doesn't clear, the publisher gets removed rather than
+		// leaving a permanently frozen frame in the room.
+		go h.watchTrackLiveness(roomSlug, claims.UserID, displayName, kind, &lastPacketNano, forwardDone)
 
 		// Broadcast track metadata to all existing participants right when track is published
 		metaBytes, _ := json.Marshal(map[string]interface{}{

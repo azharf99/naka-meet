@@ -26,6 +26,10 @@ type SignalMessage struct {
 	Text      string          `json:"text,omitempty"`
 	MediaKind string          `json:"media_kind,omitempty"`
 	Enabled   bool            `json:"enabled,omitempty"`
+	// PeerID is the target of a "set_presentation" message (host-only —
+	// see that case below): which currently-sharing publisher to put on
+	// stage. Unused by every other message type.
+	PeerID string `json:"peer_id,omitempty"`
 }
 
 // SafeConn wraps a *websocket.Conn with a mutex (gorilla/websocket panics on
@@ -282,6 +286,21 @@ func (h *Handler) broadcastPeerStale(roomSlug, peerID, peerName, kind string, st
 	h.broadcastToRoom(roomSlug, "", msgBytes)
 }
 
+// broadcastPresentationState notifies every participant which screen share
+// (if any) is currently on stage — driven by the "latest wins" rule on a
+// new share starting, a stop clearing the active share, or a host's
+// explicit set_presentation pick/reclaim. activePeerID is "" when nobody
+// is presenting. Like BroadcastRecordingState, server-triggered with no
+// single "sender" to exclude.
+func (h *Handler) broadcastPresentationState(roomSlug, activePeerID, activePeerName string) {
+	msgBytes, _ := json.Marshal(map[string]interface{}{
+		"type":             "presentation_state",
+		"active_peer_id":   activePeerID,
+		"active_peer_name": activePeerName,
+	})
+	h.broadcastToRoom(roomSlug, "", msgBytes)
+}
+
 // watchTrackLiveness polls lastPacketNano (updated by OnTrack's RTP
 // forwarding goroutine on every packet) and drives peer_stale broadcasts
 // and auto-removal via the pure nextLivenessTick decision function. It
@@ -455,6 +474,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		h.unregisterConn(roomSlug, claims.UserID)
 		_ = h.router.RemovePeer(claims.UserID)
+		// If this peer was presenting (active or suspended), clear them out
+		// of the room's screen-share state too — covers every disconnect
+		// path uniformly (tab close, network drop, host kick, stale-timeout
+		// auto-removal all end up here). A no-op, unbroadcast change for
+		// the vast majority of disconnects (participants who were never
+		// sharing at all).
+		if activeID, activeName, changed := h.rm.SetScreenSharing(roomSlug, claims.UserID, "", false); changed {
+			h.broadcastPresentationState(roomSlug, activeID, activeName)
+		}
 		leftMsg, _ := json.Marshal(map[string]interface{}{
 			"type":    "participant_left",
 			"peer_id": claims.UserID,
@@ -636,6 +664,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				h.broadcastToRoom(roomSlug, claims.UserID, messageBytes)
 			}
+
+			// Screen-share arbitration: a new share always takes the stage
+			// ("latest wins"); the client that stops sharing only takes
+			// itself off stage if it was actually the one on it — see
+			// RoomManager.SetScreenSharing's doc comment for the full rule.
+			if msg.Kind == "screen" {
+				activeID, activeName, _ := h.rm.SetScreenSharing(roomSlug, claims.UserID, displayName, true)
+				h.broadcastPresentationState(roomSlug, activeID, activeName)
+			} else if msg.Kind == "screen_stopped" {
+				activeID, activeName, changed := h.rm.SetScreenSharing(roomSlug, claims.UserID, displayName, false)
+				if changed {
+					h.broadcastPresentationState(roomSlug, activeID, activeName)
+				}
+			}
+
+		// set_presentation is the host-only override/reclaim path (BR: host
+		// can pick which active share the room sees, and take back their
+		// own if a participant's share suspended it — the same mechanism
+		// either way, just targeting a different peer_id). Gated against
+		// the room's actual recorded host, not merely a self-declared
+		// role:"host" claim, matching every other host-only action.
+		case "set_presentation":
+			hostID, isHostRoom := h.rm.GetRoomHostID(roomSlug)
+			if !isHostRoom || hostID != claims.UserID || msg.PeerID == "" {
+				continue
+			}
+			if activeName, ok := h.rm.SetActivePresentation(roomSlug, msg.PeerID); ok {
+				h.broadcastPresentationState(roomSlug, msg.PeerID, activeName)
+			}
+			// A target that isn't currently a known screen-sharing
+			// publisher (stale ID, already stopped) is silently ignored
+			// rather than putting an empty tile on stage for everyone.
 
 		case "media_state":
 			// Self-mute/camera-off relay: a sender only ever toggles its own

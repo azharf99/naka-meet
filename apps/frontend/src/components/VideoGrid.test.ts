@@ -1,5 +1,13 @@
 import { describe, test, expect } from 'vitest';
-import { getGridClass, deduplicateTracks, getInitials, deriveVisibility, getTotalTileCount } from './VideoGrid';
+import {
+  getGridClass,
+  deduplicateTracks,
+  getInitials,
+  deriveVisibility,
+  getTotalTileCount,
+  resolvePresentationView,
+} from './VideoGrid';
+import type { ParticipantTrack } from '../services/webrtc';
 
 describe('VideoGrid Helper Tests', () => {
   test('getGridClass assigns dynamic layout based on total participant count', () => {
@@ -92,6 +100,79 @@ describe('VideoGrid Helper Tests', () => {
         showVideoFallback: false,
         showMicMuted: true,
       });
+    });
+  });
+
+  describe('resolvePresentationView (screen-share arbitration)', () => {
+    const aliceScreen: ParticipantTrack = {
+      id: 'alice-screen-track',
+      peerID: 'Alice',
+      rawPeerId: 'alice-uuid',
+      stream: { id: 'alice-screen-stream' } as any,
+      isScreenShare: true,
+    };
+    const bobScreen: ParticipantTrack = {
+      id: 'bob-screen-track',
+      peerID: 'Bob',
+      rawPeerId: 'bob-uuid',
+      stream: { id: 'bob-screen-stream' } as any,
+      isScreenShare: true,
+    };
+    const carolCamera: ParticipantTrack = {
+      id: 'carol-cam-track',
+      peerID: 'Carol',
+      rawPeerId: 'carol-uuid',
+      stream: { id: 'carol-cam-stream' } as any,
+      isScreenShare: false,
+    };
+
+    test('nobody presenting: Stage Mode stays off', () => {
+      const view = resolvePresentationView([], 'host-uuid', false, '', '');
+      expect(view.stageModeActive).toBe(false);
+      expect(view.activeIsLocal).toBe(false);
+      expect(view.activeRemoteTrack).toBeUndefined();
+    });
+
+    test('a remote share is active: resolves the matching track and label', () => {
+      const view = resolvePresentationView([aliceScreen, carolCamera], 'host-uuid', false, 'alice-uuid', 'Alice');
+      expect(view.stageModeActive).toBe(true);
+      expect(view.activeIsLocal).toBe(false);
+      expect(view.activeRemoteTrack).toBe(aliceScreen);
+      expect(view.presentationLabel).toBe("Alice's Presentation");
+      expect(view.suspendedRemoteScreens).toEqual([]);
+      expect(view.localSuspended).toBe(false);
+    });
+
+    test('the local user is the active presenter', () => {
+      const view = resolvePresentationView([carolCamera], 'host-uuid', true, 'host-uuid', 'Host');
+      expect(view.activeIsLocal).toBe(true);
+      expect(view.activeRemoteTrack).toBeUndefined();
+      expect(view.presentationLabel).toBe('Your Screen Presentation');
+      expect(view.localSuspended).toBe(false);
+    });
+
+    test('a later remote share suspends an earlier one — not dropped, just not active', () => {
+      // Bob's share is active; Alice's is still live but suspended.
+      const view = resolvePresentationView([aliceScreen, bobScreen], 'host-uuid', false, 'bob-uuid', 'Bob');
+      expect(view.activeRemoteTrack).toBe(bobScreen);
+      expect(view.suspendedRemoteScreens).toEqual([aliceScreen]);
+    });
+
+    test('the local user is suspended by a remote share', () => {
+      const view = resolvePresentationView([aliceScreen], 'host-uuid', true, 'alice-uuid', 'Alice');
+      expect(view.activeIsLocal).toBe(false);
+      expect(view.localSuspended).toBe(true);
+      expect(view.stageModeActive).toBe(true);
+    });
+
+    test('Stage Mode stays active for a suspended local share even with no remote match yet', () => {
+      // activePeerId is someone else entirely (or stale/transient) but the
+      // local user is still presenting — must not silently fall back to
+      // the plain grid mid-suspension.
+      const view = resolvePresentationView([], 'host-uuid', true, 'someone-else', 'Someone');
+      expect(view.stageModeActive).toBe(true);
+      expect(view.localSuspended).toBe(true);
+      expect(view.presentationLabel).toBe('Presentation Screen');
     });
   });
 });

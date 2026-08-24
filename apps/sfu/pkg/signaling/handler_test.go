@@ -772,6 +772,225 @@ func TestSignaling_EgressRoleParticipantExemptFromRoomCap(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "egress participant should be added despite the room already being at the human-facing cap")
 }
 
+// readUntilType reads messages off ws until one decodes with the given
+// "type" field or the deadline elapses, returning it as a raw map. Used
+// throughout the screen-share arbitration tests below so an unrelated
+// message (a trickled ICE candidate, a ping) landing between the message
+// under test and the read doesn't make the test flaky — the same lesson
+// learned the hard way in the renegotiation tests above.
+func readUntilType(t *testing.T, ws *websocket.Conn, wantType string, timeout time.Duration) map[string]interface{} {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		require.NoError(t, ws.SetReadDeadline(deadline))
+		var msg map[string]interface{}
+		if err := ws.ReadJSON(&msg); err != nil {
+			return nil
+		}
+		if msg["type"] == wantType {
+			return msg
+		}
+	}
+	return nil
+}
+
+// waitForConnRegistered gives a just-dialed connection's server-side
+// goroutine a moment to run past AddPeer/registerConn before it's relied
+// on to observe a broadcast — mirrors the identical wait used above in
+// TestSignaling_JoinDuringConcurrentBroadcastDoesNotStallOwnOffer. Without
+// it, Dial() returning (as soon as the HTTP upgrade completes) races the
+// server's own post-upgrade setup, and a broadcast fired immediately after
+// dialing can land before this connection is registered to receive it.
+func waitForConnRegistered() {
+	time.Sleep(20 * time.Millisecond)
+}
+
+// TestSignaling_ScreenShareArbitration_LatestSharePresentedAndBroadcast
+// covers BR: when multiple participants share simultaneously, the latest
+// one is what the room actually sees by default, and everyone is told via
+// presentation_state — not just whoever happens to render first.
+func TestSignaling_ScreenShareArbitration_LatestSharePresentedAndBroadcast(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	// Connecting first makes this the room's recorded host (see
+	// ServeHTTP's CreateOrGetRoom call) — irrelevant to this test's
+	// "latest wins" assertion, but matches how every other test in this
+	// file establishes host authority.
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host", "host", secret, 1*time.Hour)
+	wsHostURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=arb-room&token=" + hostToken
+	wsHost, _, err := websocket.DefaultDialer.Dial(wsHostURL, nil)
+	require.NoError(t, err)
+	defer wsHost.Close()
+
+	observerID, _ := uuid.NewV7()
+	observerToken, _ := auth.GenerateTokenWithName(observerID.String(), "Observer", "participant", secret, 1*time.Hour)
+	wsObsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=arb-room&token=" + observerToken
+	wsObs, _, err := websocket.DefaultDialer.Dial(wsObsURL, nil)
+	require.NoError(t, err)
+	defer wsObs.Close()
+	waitForConnRegistered()
+
+	require.NoError(t, wsHost.WriteJSON(map[string]string{"type": "track_metadata", "stream_id": "host-screen", "kind": "screen"}))
+	msg := readUntilType(t, wsObs, "presentation_state", 2*time.Second)
+	require.NotNil(t, msg, "observer should see the host's share become the active presentation")
+	assert.Equal(t, hostID.String(), msg["active_peer_id"])
+	assert.Equal(t, "Host", msg["active_peer_name"])
+
+	guestID, _ := uuid.NewV7()
+	guestToken, _ := auth.GenerateTokenWithName(guestID.String(), "Guest", "participant", secret, 1*time.Hour)
+	wsGuestURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=arb-room&token=" + guestToken
+	wsGuest, _, err := websocket.DefaultDialer.Dial(wsGuestURL, nil)
+	require.NoError(t, err)
+	defer wsGuest.Close()
+	waitForConnRegistered()
+
+	require.NoError(t, wsGuest.WriteJSON(map[string]string{"type": "track_metadata", "stream_id": "guest-screen", "kind": "screen"}))
+	msg = readUntilType(t, wsObs, "presentation_state", 2*time.Second)
+	require.NotNil(t, msg, "the guest's later share should take over the stage")
+	assert.Equal(t, guestID.String(), msg["active_peer_id"])
+	assert.Equal(t, "Guest", msg["active_peer_name"])
+}
+
+// TestSignaling_SetPresentation_HostCanReclaimSuspendedShare covers BR:
+// when a participant's share suspends the host's own, the host can take it
+// back — the same set_presentation mechanism as picking anyone else's
+// share, just targeting their own ID.
+func TestSignaling_SetPresentation_HostCanReclaimSuspendedShare(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host", "host", secret, 1*time.Hour)
+	wsHostURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=reclaim-room&token=" + hostToken
+	wsHost, _, err := websocket.DefaultDialer.Dial(wsHostURL, nil)
+	require.NoError(t, err)
+	defer wsHost.Close()
+
+	guestID, _ := uuid.NewV7()
+	guestToken, _ := auth.GenerateTokenWithName(guestID.String(), "Guest", "participant", secret, 1*time.Hour)
+	wsGuestURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=reclaim-room&token=" + guestToken
+	wsGuest, _, err := websocket.DefaultDialer.Dial(wsGuestURL, nil)
+	require.NoError(t, err)
+	defer wsGuest.Close()
+	waitForConnRegistered()
+
+	require.NoError(t, wsHost.WriteJSON(map[string]string{"type": "track_metadata", "stream_id": "host-screen", "kind": "screen"}))
+	require.NotNil(t, readUntilType(t, wsGuest, "presentation_state", 2*time.Second))
+	// wsHost also receives its own broadcast (server-triggered, no sender
+	// exclusion — matches BroadcastRecordingState's pattern) — drain it so
+	// the next read below can't pick up this stale copy instead of the
+	// guest's actual share.
+	require.NotNil(t, readUntilType(t, wsHost, "presentation_state", 2*time.Second))
+
+	require.NoError(t, wsGuest.WriteJSON(map[string]string{"type": "track_metadata", "stream_id": "guest-screen", "kind": "screen"}))
+	msg := readUntilType(t, wsHost, "presentation_state", 2*time.Second)
+	require.NotNil(t, msg)
+	require.Equal(t, guestID.String(), msg["active_peer_id"], "guest's share should have suspended the host's")
+
+	// Drain guest's own copy of its share broadcast, same reason as above —
+	// otherwise the reclaim read below could pick up this stale copy.
+	require.NotNil(t, readUntilType(t, wsGuest, "presentation_state", 2*time.Second))
+
+	require.NoError(t, wsHost.WriteJSON(map[string]interface{}{"type": "set_presentation", "peer_id": hostID.String()}))
+	msg = readUntilType(t, wsGuest, "presentation_state", 2*time.Second)
+	require.NotNil(t, msg, "guest should see the host reclaim the stage")
+	assert.Equal(t, hostID.String(), msg["active_peer_id"])
+	assert.Equal(t, "Host", msg["active_peer_name"])
+}
+
+// TestSignaling_SetPresentation_NonHostRejected guards the host-only gate:
+// a guest's JWT (even one it could self-declare role:"host" on, which
+// GetRoomHostID's actual-ownership check exists to defeat) must never be
+// able to change the room's active presentation.
+func TestSignaling_SetPresentation_NonHostRejected(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host", "host", secret, 1*time.Hour)
+	wsHostURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=nonhost-room&token=" + hostToken
+	wsHost, _, err := websocket.DefaultDialer.Dial(wsHostURL, nil)
+	require.NoError(t, err)
+	defer wsHost.Close()
+
+	guestID, _ := uuid.NewV7()
+	guestToken, _ := auth.GenerateTokenWithName(guestID.String(), "Guest", "participant", secret, 1*time.Hour)
+	wsGuestURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=nonhost-room&token=" + guestToken
+	wsGuest, _, err := websocket.DefaultDialer.Dial(wsGuestURL, nil)
+	require.NoError(t, err)
+	defer wsGuest.Close()
+	waitForConnRegistered()
+
+	require.NoError(t, wsHost.WriteJSON(map[string]string{"type": "track_metadata", "stream_id": "host-screen", "kind": "screen"}))
+	require.NotNil(t, readUntilType(t, wsGuest, "presentation_state", 2*time.Second))
+	// wsHost's own copy of that same broadcast — drain it, or the read
+	// below would immediately match this stale message instead of proving
+	// no new one arrived after the guest's rejected attempt.
+	require.NotNil(t, readUntilType(t, wsHost, "presentation_state", 2*time.Second))
+
+	require.NoError(t, wsGuest.WriteJSON(map[string]interface{}{"type": "set_presentation", "peer_id": guestID.String()}))
+
+	msg := readUntilType(t, wsHost, "presentation_state", 400*time.Millisecond)
+	assert.Nil(t, msg, "a non-host's set_presentation must be silently rejected, not change who's on stage")
+
+	gotID, _, _ := rm.GetActivePresentation("nonhost-room")
+	assert.Equal(t, hostID.String(), gotID, "the stage must remain unchanged")
+}
+
+// TestSignaling_SetPresentation_RejectsNonPresentingTarget guards against
+// the host targeting a stale or bogus peer_id — must not put an empty
+// tile on stage for everyone.
+func TestSignaling_SetPresentation_RejectsNonPresentingTarget(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host", "host", secret, 1*time.Hour)
+	wsHostURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=stale-target-room&token=" + hostToken
+	wsHost, _, err := websocket.DefaultDialer.Dial(wsHostURL, nil)
+	require.NoError(t, err)
+	defer wsHost.Close()
+
+	require.NoError(t, wsHost.WriteJSON(map[string]string{"type": "track_metadata", "stream_id": "host-screen", "kind": "screen"}))
+
+	require.Eventually(t, func() bool {
+		id, _, _ := rm.GetActivePresentation("stale-target-room")
+		return id == hostID.String()
+	}, 2*time.Second, 10*time.Millisecond)
+
+	bogusID, _ := uuid.NewV7()
+	require.NoError(t, wsHost.WriteJSON(map[string]interface{}{"type": "set_presentation", "peer_id": bogusID.String()}))
+
+	// Nothing to observe it on (host is the sole connection and would be
+	// excluded from its own broadcast anyway), so assert against the
+	// authoritative state directly: it must not have moved.
+	time.Sleep(200 * time.Millisecond)
+	gotID, _, _ := rm.GetActivePresentation("stale-target-room")
+	assert.Equal(t, hostID.String(), gotID, "targeting a non-presenting peer must be refused, not clear the stage")
+}
+
 
 
 

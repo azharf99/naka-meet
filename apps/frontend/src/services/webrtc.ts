@@ -51,6 +51,11 @@ export class WebRTCService {
   // — lets the grid show a "reconnecting" state instead of a permanently
   // frozen last frame with no explanation.
   public onPeerStaleChanged?: PeerStaleCallback;
+  // Fired whenever the room's arbitrated active screen share changes — a
+  // new share starting ("latest wins"), an active share stopping, or a
+  // host's set_presentation pick/reclaim. activePeerId is '' when nobody
+  // is presenting.
+  public onPresentationStateChanged?: (state: { activePeerId: string; activePeerName: string }) => void;
   // Fired when THIS client is force-removed by the host (or by the
   // server's stale-timeout auto-removal) — distinct from onDisconnected so
   // the UI can show "You were removed" instead of a generic drop/reload
@@ -283,6 +288,21 @@ export class WebRTCService {
         return;
       }
 
+      if (msg.type === 'presentation_state') {
+        // active_peer_id/active_peer_name here are the raw ID + name, not
+        // the peerName-as-peerID convention used elsewhere — this is
+        // matched against ParticipantTrack.rawPeerId in VideoGrid, not
+        // track.peerID, since arbitration targets a real participant, not
+        // a display-name-keyed tile.
+        if (this.onPresentationStateChanged) {
+          this.onPresentationStateChanged({
+            activePeerId: msg.active_peer_id || '',
+            activePeerName: msg.active_peer_name || '',
+          });
+        }
+        return;
+      }
+
       if (msg.type === 'removed') {
         this.wasRemoved = true;
         if (this.onRemoved) this.onRemoved(msg.reason || 'host_removed');
@@ -427,6 +447,17 @@ export class WebRTCService {
   public sendMediaState(kind: 'mic' | 'cam', enabled: boolean): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ type: 'media_state', media_kind: kind, enabled }));
+  }
+
+  // Host-only screen-share arbitration override: pick any currently-sharing
+  // participant (by raw peer ID) as the room's active presentation,
+  // including the host's own ID to reclaim a share that got suspended by
+  // someone else's. Authorization is enforced server-side (the server
+  // silently ignores this from a non-host or for a peer who isn't actually
+  // sharing) — this just sends the request.
+  public setPresentation(peerId: string): void {
+    if (!peerId || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'set_presentation', peer_id: peerId }));
   }
 
   // Chat is relayed by the SFU over the signaling WebSocket, not a

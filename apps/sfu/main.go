@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -48,12 +49,8 @@ func main() {
 	if originsEnv == "" {
 		originsEnv = "http://localhost:3000"
 	}
-	var allowedOrigins []string
-	for _, o := range strings.Split(originsEnv, ",") {
-		if o = strings.TrimSpace(o); o != "" {
-			allowedOrigins = append(allowedOrigins, o)
-		}
-	}
+	allowedOrigins := resolveAllowedOrigins(originsEnv, os.Getenv("FRONTEND_URL"))
+
 	secureCookies := os.Getenv("COOKIE_SECURE") == "true"
 
 	redisURL := os.Getenv("REDIS_URL")
@@ -131,4 +128,52 @@ func main() {
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+// resolveAllowedOrigins builds the final CORS/WS-upgrade origin allowlist:
+// the operator-configured, comma-separated originsEnv (ALLOWED_ORIGINS),
+// plus — automatically, not requiring separate configuration — the origin
+// derived from frontendURL (FRONTEND_URL).
+//
+// The egress worker's headless Chromium is itself a WS client subject to
+// this same origin allowlist: it connects using FRONTEND_URL's origin (the
+// Docker-internal hostname, e.g. http://frontend:3000), which is never one
+// of the browser-facing entries an operator would think to put in
+// ALLOWED_ORIGINS. Without this, that connection is silently rejected —
+// the egress recorder can never actually join the room, so every
+// recording captures nothing at all, regardless of any client-side
+// timing/readiness fix. FRONTEND_URL is already a trusted,
+// operator-configured internal address, not user input, so folding its
+// origin in here is safe.
+//
+// Pulled out of main() as a pure function (no env reads, no logging side
+// effects beyond what's returned) specifically so this parsing/dedup logic
+// — exactly the kind of thing that silently breaks egress for months, as
+// it just did — has a direct unit test instead of only being checkable by
+// booting the whole server.
+func resolveAllowedOrigins(originsEnv, frontendURL string) []string {
+	var allowedOrigins []string
+	for _, o := range strings.Split(originsEnv, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allowedOrigins = append(allowedOrigins, o)
+		}
+	}
+
+	if frontendURL == "" {
+		return allowedOrigins
+	}
+
+	u, err := url.Parse(frontendURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		log.Printf("main: FRONTEND_URL %q could not be parsed as a URL — the egress worker's own WS connection may be rejected by ALLOWED_ORIGINS", frontendURL)
+		return allowedOrigins
+	}
+
+	frontendOrigin := u.Scheme + "://" + u.Host
+	for _, o := range allowedOrigins {
+		if o == frontendOrigin {
+			return allowedOrigins
+		}
+	}
+	return append(allowedOrigins, frontendOrigin)
 }

@@ -39,8 +39,13 @@ test('a participant joining from a different-but-allowed origin (127.0.0.1) appe
 
     // No "Couldn't connect — this address isn't allowed by the server"
     // banner (App.tsx's rejected-origin message) — the guest should reach
-    // the meeting UI at all.
-    await expect(guestPage.getByTestId('video-tile')).toHaveCount(1, { timeout: 15_000 });
+    // the meeting UI and see both themselves and the host. No intermediate
+    // "exactly 1 tile" check here: the host is already publishing by the
+    // time the guest joins, so the server's pre-existing-track push can
+    // legitimately land before or after the guest's own self-tile render —
+    // asserting exactly 1 would just race the app's own correct behavior
+    // (see grid.spec.ts's comment on the same race).
+    await expect(guestPage.getByTestId('video-tile')).toHaveCount(2, { timeout: 20_000 });
 
     // And, critically, the host — on the ORIGINAL origin — should see the
     // cross-origin guest show up in their grid too.

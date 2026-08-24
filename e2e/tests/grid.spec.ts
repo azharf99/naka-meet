@@ -43,13 +43,17 @@ test('a guest joining from a separate browser context appears in the host\'s gri
     await expect(hostPage.getByTestId('video-tile')).toHaveCount(1, { timeout: 15_000 });
 
     await joinAsGuest(guestPage, 'E2E Guest', roomSlug);
-    // Guest sees themselves immediately too.
-    await expect(guestPage.getByTestId('video-tile')).toHaveCount(1, { timeout: 15_000 });
 
     // The real assertion: once signaling/SDP/track fan-out has actually
     // completed, BOTH pages should show 2 tiles — this is what "grid
     // doesn't update for participants joining from a different browser"
-    // (Issue 1) looked like when it was broken: one side stuck at 1.
+    // (Issue 1) looked like when it was broken: one side stuck at 1. Note
+    // there's no intermediate "guest sees exactly 1 tile" assertion here —
+    // by the time the guest joins, the host is already publishing, so the
+    // server's SubscribePeerToRoomTracks push of the host's pre-existing
+    // track can legitimately land before the guest's own self-tile even
+    // finishes its first render pass; asserting exactly 1 there would just
+    // be racing the app's own (correct, fast) behavior.
     await expect(hostPage.getByTestId('video-tile')).toHaveCount(2, { timeout: 20_000 });
     await expect(guestPage.getByTestId('video-tile')).toHaveCount(2, { timeout: 20_000 });
   } finally {

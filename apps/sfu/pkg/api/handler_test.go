@@ -620,6 +620,148 @@ func TestAPI_RemoveParticipantHandler_UnknownParticipantReturns404(t *testing.T)
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestAPI_MuteParticipantHandler_HostCanMute(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	var gotSlug, gotParticipantID string
+	handler.SetParticipantMuter(func(slug, participantID string) bool {
+		gotSlug, gotParticipantID = slug, participantID
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	guestID, _ := uuid.NewV7()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+guestID.String()+"/mute", nil)
+	req.Header.Set("Authorization", "Bearer "+hostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "demo-room", gotSlug)
+	assert.Equal(t, guestID.String(), gotParticipantID)
+}
+
+func TestAPI_MuteParticipantHandler_NonOwnerHostForbidden(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	muterCalled := false
+	handler.SetParticipantMuter(func(string, string) bool {
+		muterCalled = true
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	otherHostID, _ := uuid.NewV7()
+	otherHostToken, _ := auth.GenerateTokenWithName(otherHostID.String(), "Other Host", "host", secret, time.Hour)
+
+	guestID, _ := uuid.NewV7()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+guestID.String()+"/mute", nil)
+	req.Header.Set("Authorization", "Bearer "+otherHostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.False(t, muterCalled, "an unrelated host's JWT must never reach the actual mute callback")
+}
+
+func TestAPI_MuteParticipantHandler_GuestForbidden(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	muterCalled := false
+	handler.SetParticipantMuter(func(string, string) bool {
+		muterCalled = true
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	guestID, _ := uuid.NewV7()
+	guestToken, _ := auth.GenerateTokenWithName(guestID.String(), "Guest", "guest", secret, time.Hour)
+	otherID, _ := uuid.NewV7()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+otherID.String()+"/mute", nil)
+	req.Header.Set("Authorization", "Bearer "+guestToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.False(t, muterCalled)
+}
+
+func TestAPI_MuteParticipantHandler_CannotTargetSelf(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	muterCalled := false
+	handler.SetParticipantMuter(func(string, string) bool {
+		muterCalled = true
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+hostID.String()+"/mute", nil)
+	req.Header.Set("Authorization", "Bearer "+hostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.False(t, muterCalled, "a host targeting their own ID should be rejected before reaching the mute callback")
+}
+
+func TestAPI_MuteParticipantHandler_UnknownParticipantReturns404(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	handler.SetParticipantMuter(func(string, string) bool { return false })
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	guestID, _ := uuid.NewV7()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+guestID.String()+"/mute", nil)
+	req.Header.Set("Authorization", "Bearer "+hostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
 func TestAPI_CreateRoomHandler_HostAllowed(t *testing.T) {
 	secret := []byte("api-secret-key")
 	handler := api.NewAPIHandler(secret, nil)

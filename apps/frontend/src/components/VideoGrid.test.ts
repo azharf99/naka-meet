@@ -6,6 +6,7 @@ import {
   deriveVisibility,
   getTotalTileCount,
   resolvePresentationView,
+  getSidebarLayoutClasses,
 } from './VideoGrid';
 import type { ParticipantTrack } from '../services/webrtc';
 
@@ -173,6 +174,24 @@ describe('VideoGrid Helper Tests', () => {
       expect(view.stageModeActive).toBe(true);
       expect(view.localSuspended).toBe(true);
       expect(view.presentationLabel).toBe('Presentation Screen');
+    });
+  });
+
+  describe('getSidebarLayoutClasses (Stage Mode sidebar scroll-vs-shrink)', () => {
+    test('the egress recorder keeps the shrink-to-fit, no-scroll layout', () => {
+      // Its viewport can never scroll (FFmpeg only ever captures whatever's
+      // currently visible), so every tile must stay on screen, however small.
+      const layout = getSidebarLayoutClasses(true);
+      expect(layout.container).toContain('overflow-hidden');
+      expect(layout.container).not.toContain('overflow-y-auto');
+      expect(layout.tile).toContain('min-h-0');
+    });
+
+    test('a real user-facing UI scrolls instead of shrinking tiles past legibility', () => {
+      const layout = getSidebarLayoutClasses(false);
+      expect(layout.container).toContain('overflow-y-auto');
+      expect(layout.container).not.toContain('overflow-hidden');
+      expect(layout.tile).not.toContain('min-h-0');
     });
   });
 });

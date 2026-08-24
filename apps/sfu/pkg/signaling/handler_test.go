@@ -713,6 +713,70 @@ func TestSignaling_RemoveParticipant_ReturnsFalseWhenNotConnected(t *testing.T) 
 	assert.False(t, removed)
 }
 
+// TestSignaling_ForceMuteParticipant_SendsForceMuteMessage covers BR1: the
+// target should receive a distinct "force_mute" message it can act on
+// itself (disabling its own local audio track is something only the
+// target's own browser can do).
+func TestSignaling_ForceMuteParticipant_SendsForceMuteMessage(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	guestID, _ := uuid.NewV7()
+	guestToken, _ := auth.GenerateTokenWithName(guestID.String(), "Guest", "participant", secret, 1*time.Hour)
+	wsGuestURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=mute-room&token=" + guestToken
+	wsGuest, _, err := websocket.DefaultDialer.Dial(wsGuestURL, nil)
+	require.NoError(t, err)
+	defer wsGuest.Close()
+
+	var muted bool
+	require.Eventually(t, func() bool {
+		muted = handler.ForceMuteParticipant("mute-room", guestID.String())
+		return muted
+	}, 2*time.Second, 10*time.Millisecond, "ForceMuteParticipant should eventually succeed once the guest's connection finishes registering")
+
+	msg := readUntilType(t, wsGuest, "force_mute", 2*time.Second)
+	require.NotNil(t, msg, "the target should receive a force_mute message it can act on itself")
+}
+
+// TestSignaling_ForceMuteParticipant_ScopedToRoom mirrors
+// TestSignaling_RemoveParticipant_ScopedToRoom: a host must never be able
+// to force-mute a participant outside the room they have authority over.
+func TestSignaling_ForceMuteParticipant_ScopedToRoom(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	guestID, _ := uuid.NewV7()
+	guestToken, _ := auth.GenerateTokenWithName(guestID.String(), "Guest", "participant", secret, 1*time.Hour)
+	wsGuestURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=real-mute-room&token=" + guestToken
+	wsGuest, _, err := websocket.DefaultDialer.Dial(wsGuestURL, nil)
+	require.NoError(t, err)
+	defer wsGuest.Close()
+
+	muted := handler.ForceMuteParticipant("some-other-room", guestID.String())
+	assert.False(t, muted, "ForceMuteParticipant must not act on a participant who isn't in the specified room")
+}
+
+func TestSignaling_ForceMuteParticipant_ReturnsFalseWhenNotConnected(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	unknownID, _ := uuid.NewV7()
+	muted := handler.ForceMuteParticipant("empty-room", unknownID.String())
+	assert.False(t, muted)
+}
+
 // TestSignaling_EgressRoleParticipantExemptFromRoomCap reproduces the egress
 // recorder occupying a real slot against the human-facing 50-participant
 // cap: every recording session permanently reduced real headroom in the

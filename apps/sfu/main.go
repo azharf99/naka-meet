@@ -109,6 +109,9 @@ func main() {
 	// disconnect someone — apiHandler only owns RoomManager bookkeeping, not
 	// the live WebSocket connections signalingHandler holds.
 	apiHandler.SetParticipantRemover(signalingHandler.RemoveParticipant)
+	// So the host-only "mute participant" REST endpoint (BR1) can actually
+	// reach them.
+	apiHandler.SetParticipantMuter(signalingHandler.ForceMuteParticipant)
 
 	mux := http.NewServeMux()
 

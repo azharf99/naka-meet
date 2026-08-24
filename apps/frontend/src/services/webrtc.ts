@@ -8,6 +8,30 @@ import { getIceServers } from './auth';
 // immediately.
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
+// acquireLocalMedia requests camera and microphone as two independent
+// getUserMedia calls instead of one combined {video, audio} request. A
+// single combined call fails BOTH devices if either one is busy/denied
+// (e.g. the camera is held by another app) — a common, unremarkable
+// situation that used to drop the participant to fully receive-only
+// instead of just going camera-off or mic-off for the one device that
+// actually failed. Each failure is caught independently so one busy
+// device degrades only itself.
+async function acquireLocalMedia(): Promise<MediaStream | null> {
+  const [videoResult, audioResult] = await Promise.all([
+    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } }).catch((err) => {
+      console.warn('Could not access camera, proceeding without video', err);
+      return null;
+    }),
+    navigator.mediaDevices.getUserMedia({ audio: true }).catch((err) => {
+      console.warn('Could not access microphone, proceeding without audio', err);
+      return null;
+    }),
+  ]);
+
+  const tracks = [...(videoResult?.getTracks() ?? []), ...(audioResult?.getTracks() ?? [])];
+  return tracks.length > 0 ? new MediaStream(tracks) : null;
+}
+
 export interface ParticipantTrack {
   id: string;
   peerID: string;
@@ -100,12 +124,7 @@ export class WebRTCService {
     // corporate firewalls) — invisible on a single LAN, which is exactly
     // why that class of failure is easy to ship without noticing.
     const [mediaResult, iceServers] = await Promise.all([
-      navigator.mediaDevices
-        .getUserMedia({ video: { width: 1280, height: 720 }, audio: true })
-        .catch((err) => {
-          console.warn('Could not access media devices, proceeding audio/video muted', err);
-          return null;
-        }),
+      acquireLocalMedia(),
       getIceServers(token)
         .then((res) => (res.iceServers.length > 0 ? res.iceServers : FALLBACK_ICE_SERVERS))
         .catch((err) => {

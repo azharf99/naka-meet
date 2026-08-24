@@ -31,15 +31,40 @@ class MockWebSocket {
   readyState: number = 1; // WebSocket.OPEN
 }
 
+// Minimal stand-in for the real MediaStream constructor (not available in
+// vitest's node test environment) — just enough surface (getTracks) for
+// acquireLocalMedia's merge-two-independent-getUserMedia-calls logic.
+class MockMediaStream {
+  private tracks: any[];
+  constructor(tracks: any[] = []) {
+    this.tracks = tracks;
+  }
+  getTracks() {
+    return this.tracks;
+  }
+}
+
 Object.defineProperty(globalThis, 'RTCPeerConnection', { value: MockRTCPeerConnection, writable: true });
 Object.defineProperty(globalThis, 'WebSocket', { value: MockWebSocket, writable: true });
 Object.defineProperty(globalThis, 'RTCSessionDescription', { value: vi.fn(), writable: true });
 Object.defineProperty(globalThis, 'RTCIceCandidate', { value: vi.fn(), writable: true });
+Object.defineProperty(globalThis, 'MediaStream', { value: MockMediaStream, writable: true });
 Object.defineProperty(globalThis, 'navigator', {
   value: {
     mediaDevices: {
-      getUserMedia: vi.fn().mockResolvedValue({
-        getTracks: () => [],
+      // Constraint-aware: acquireLocalMedia makes two independent calls
+      // (video-only, audio-only) rather than one combined {video, audio}
+      // request, so the mock needs to answer each on its own — see the
+      // "camera busy" / "microphone busy" tests below, which override this
+      // per-call to prove one failing device doesn't take down the other.
+      getUserMedia: vi.fn().mockImplementation((constraints: any) => {
+        if (constraints?.video) {
+          return Promise.resolve({ getTracks: () => [{ kind: 'video', id: 'video-track', stop: vi.fn() }] });
+        }
+        if (constraints?.audio) {
+          return Promise.resolve({ getTracks: () => [{ kind: 'audio', id: 'audio-track', stop: vi.fn() }] });
+        }
+        return Promise.resolve({ getTracks: () => [] });
       }),
       getDisplayMedia: vi.fn().mockResolvedValue({
         id: 'screen-stream-1',
@@ -96,6 +121,50 @@ describe('WebRTCService Audit & Unit Tests', () => {
 
     const pc = (service as any).pc as MockRTCPeerConnection;
     expect(pc.iceServers).toEqual([{ urls: 'stun:stun.l.google.com:19302' }]);
+  });
+
+  test('a busy camera does not also take down the microphone (split getUserMedia calls)', async () => {
+    // acquireLocalMedia issues the video call before the audio call (see its
+    // Promise.all) — mockImplementationOnce twice, each consumed by exactly
+    // one call, so this override doesn't leak into later tests the way a
+    // persistent mockImplementation would (this file has no afterEach reset).
+    const gum = globalThis.navigator.mediaDevices.getUserMedia as any;
+    gum.mockImplementationOnce(() => Promise.reject(new Error('Could not start video source')));
+    gum.mockImplementationOnce(() => Promise.resolve({ getTracks: () => [{ kind: 'audio', id: 'audio-track', stop: vi.fn() }] }));
+
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const stream = service.getLocalStream();
+    expect(stream).not.toBeNull();
+    expect(stream!.getTracks().map((t: any) => t.kind)).toEqual(['audio']);
+
+    const pc = (service as any).pc as MockRTCPeerConnection;
+    expect(pc.addTrack).toHaveBeenCalledTimes(1);
+  });
+
+  test('a busy microphone does not also take down the camera (split getUserMedia calls)', async () => {
+    const gum = globalThis.navigator.mediaDevices.getUserMedia as any;
+    gum.mockImplementationOnce(() => Promise.resolve({ getTracks: () => [{ kind: 'video', id: 'video-track', stop: vi.fn() }] }));
+    gum.mockImplementationOnce(() => Promise.reject(new Error('Could not start audio source')));
+
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const stream = service.getLocalStream();
+    expect(stream).not.toBeNull();
+    expect(stream!.getTracks().map((t: any) => t.kind)).toEqual(['video']);
+  });
+
+  test('both camera and microphone busy leaves localStream null (fully receive-only), same as before', async () => {
+    const gum = globalThis.navigator.mediaDevices.getUserMedia as any;
+    gum.mockImplementationOnce(() => Promise.reject(new Error('NotAllowedError')));
+    gum.mockImplementationOnce(() => Promise.reject(new Error('NotAllowedError')));
+
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    expect(service.getLocalStream()).toBeNull();
   });
 
   test('sendMessage relays chat via the signaling WebSocket and echoes it locally', async () => {

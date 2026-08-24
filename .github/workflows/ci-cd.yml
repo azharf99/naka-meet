@@ -126,6 +126,16 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # docker-compose.yml's services declare `env_file: - .env`; .env is
+      # gitignored and never checked out, so compose fails outright with
+      # "env file .env not found" before docker-compose.e2e.yml's own
+      # `env_file: - .env.e2e` override even gets a chance to matter — this
+      # sidesteps needing to know whether the installed compose version
+      # replaces or merges an overridden env_file list, by making the two
+      # files identical so it can't matter either way.
+      - name: Provide .env for compose (mirrors .env.e2e)
+        run: cp .env.e2e .env
+
       - name: Build stack from source (not :latest)
         run: docker compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml build
 

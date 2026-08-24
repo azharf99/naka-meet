@@ -193,7 +193,7 @@ jobs:
   build-and-deploy:
     name: Build Image and Deploy to VPS
     runs-on: ubuntu-latest
-    needs: [test-sfu, test-sfu-integration, test-frontend, test-egress]
+    needs: [test-sfu, test-sfu-integration, test-frontend, test-egress, test-e2e]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     if: github.ref == 'refs/heads/main' # Hanya jalankan saat push ke main, setelah semua test lulus

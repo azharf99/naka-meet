@@ -45,7 +45,7 @@ Postgres, real SDP negotiation.
    docker-compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml down -v
    ```
 
-## A known limitation on Windows + Docker Desktop
+## A known limitation on Windows + Docker Desktop (confirmed local-only)
 
 Verifying this suite while building it, running Playwright natively on
 Windows against a Docker Desktop stack, the single-peer legs all verified
@@ -58,20 +58,22 @@ exchanged over the signaling WS), but no actual RTP ever appeared to
 reach the SFU, so the server-side `pc.OnTrack` that triggers the
 `track_metadata`/renegotiation broadcast never fired.
 
-This matches Docker Desktop's WSL2-VM network boundary — a plain TCP probe
-from the Windows host to the SFU container's internal bridge IP
-(`172.18.0.x`) failed outright, and the srflx candidates gathered are also
-subject to same-machine NAT hairpin behavior that varies by router/firewall
-and isn't representative of two independent participants. Neither of these
-apply to the target CI environment (GitHub Actions `ubuntu-latest`, Docker
-running natively — no VM boundary between the runner's own network stack
-and the docker0 bridge) or to a real deployment (the project is documented
-as developed/tested on Windows + **WSL2** + Docker, not Docker Desktop's
-Windows-native networking path).
+That traced to Docker Desktop's WSL2-VM network boundary — a plain TCP
+probe from the Windows host to the SFU container's internal bridge IP
+(`172.18.0.x`) failed outright — plus same-machine NAT-hairpin behavior for
+the gathered srflx candidates, neither of which apply on a real Linux
+Docker host. **Confirmed on CI** (GitHub Actions `ubuntu-latest`, native
+Docker): the cross-peer leg works correctly — both `grid.spec.ts` and
+`origin.spec.ts` pass, including the guest seeing the host's pre-existing
+track land essentially immediately after joining (fast enough that an
+early version of these tests, which asserted the guest saw exactly one
+tile right after joining, flaked against the app's own correct, fast
+behavior — see git history). So: genuinely a local-Windows-only artifact,
+not a gap in the SFU's ICE handling. `test-e2e` is part of
+`build-and-deploy`'s required checks.
 
-If `test-e2e` in CI shows the same cross-peer symptom (tile count stuck at
-1 on both sides) rather than this being purely a local artifact, that would
-point at a genuine gap in the SFU's ICE candidate advertisement when
-running inside Docker (e.g. needing `SettingEngine.SetNAT1To1IPs` so it
-advertises a reachable address instead of the container-internal one) —
-worth a follow-up investigation, not something this suite's job is to fix.
+If you're verifying changes locally on Windows + Docker Desktop, expect
+the cross-peer assertions specifically to fail or hang for this same
+reason — the single-peer setup steps (signup, room creation, guest join)
+are still meaningful to check locally, the final tile-count assertions are
+not.

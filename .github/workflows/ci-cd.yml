@@ -127,10 +127,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build stack from source (not :latest)
-        run: docker-compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml build
+        run: docker compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml build
 
       - name: Start stack
-        run: docker-compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml up -d
+        run: docker compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml up -d
 
       - name: Wait for frontend to respond
         run: |
@@ -142,7 +142,7 @@ jobs:
             sleep 2
           done
           echo "frontend never came up" >&2
-          docker-compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml logs
+          docker compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml logs
           exit 1
 
       - name: Set up Node
@@ -174,11 +174,11 @@ jobs:
 
       - name: Stack logs (always, for debugging)
         if: always()
-        run: docker-compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml logs
+        run: docker compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml logs
 
       - name: Tear down stack
         if: always()
-        run: docker-compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml down -v
+        run: docker compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml down -v
 
   build-and-deploy:
     name: Build Image and Deploy to VPS

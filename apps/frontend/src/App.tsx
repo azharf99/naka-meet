@@ -15,6 +15,11 @@ export const App: React.FC = () => {
   const [displayName, setDisplayName] = useState<string>('');
   const [token, setToken] = useState<string>('');
   const [userRole, setUserRole] = useState<string>('host');
+  // This client's own raw participant ID — distinct from displayName,
+  // needed to tell whether the room's active presentation (identified by
+  // peer ID, see activePresentation below) is this client's own screen
+  // share or someone else's.
+  const [localPeerId, setLocalPeerId] = useState<string>('');
 
   const [webrtcService, setWebrtcService] = useState<WebRTCService | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -32,6 +37,11 @@ export const App: React.FC = () => {
   // banner, since unlike a network drop there's nothing to reload/retry.
   const [removedReason, setRemovedReason] = useState<string | null>(null);
   const [recordingConsent, setRecordingConsent] = useState<{ active: boolean; kind: string } | null>(null);
+  // The room's currently-arbitrated active screen share (BR: latest share
+  // wins by default; host can pick or reclaim). null when nobody is
+  // presenting — distinct from "someone is presenting but suspended,"
+  // which VideoGrid derives locally from remoteTracks + this peer ID.
+  const [activePresentation, setActivePresentation] = useState<{ peerId: string; peerName: string } | null>(null);
 
   const [chatOpen, setChatOpen] = useState(false);
   const [messages, setMessages] = useState<Array<{ sender: string; text: string; time: string }>>([]);
@@ -48,6 +58,7 @@ export const App: React.FC = () => {
       const authData = await guestJoin(name, targetRoomSlug, role);
       setToken(authData.token);
       setUserRole(authData.role || role);
+      setLocalPeerId(authData.user_id);
       setDisplayName(name);
       setRoomSlug(targetRoomSlug);
       setInMeeting(true);
@@ -64,6 +75,7 @@ export const App: React.FC = () => {
   const handleEnterAsHost = (session: HostSession, activeSlug: string) => {
     setToken(session.token);
     setUserRole(session.role || 'host');
+    setLocalPeerId(session.user_id);
     setDisplayName(session.name);
     setRoomSlug(activeSlug);
     setInMeeting(true);
@@ -85,7 +97,7 @@ export const App: React.FC = () => {
         // that follows uses credentials:'include', and the backend already
         // prefers the cookie over an empty/missing Bearer header, so this
         // still authenticates correctly for both REST and the WS handshake.
-        setRestoredHostSession({ token: '', name: session.name, role: session.role });
+        setRestoredHostSession({ token: '', name: session.name, role: session.role, user_id: session.user_id });
       }
       setSessionChecked(true);
     });
@@ -123,6 +135,7 @@ export const App: React.FC = () => {
     setConnectionRejected(false);
     setRemoteStaleState(new Map());
     setRemovedReason(null);
+    setActivePresentation(null);
     setInMeeting(false);
     window.history.pushState({}, '', window.location.pathname);
   };
@@ -204,6 +217,10 @@ export const App: React.FC = () => {
         // notice instead of the generic connection-lost banner.
         service.onRemoved = (reason) => {
           setRemovedReason(reason);
+        };
+
+        service.onPresentationStateChanged = ({ activePeerId, activePeerName }) => {
+          setActivePresentation(activePeerId ? { peerId: activePeerId, peerName: activePeerName } : null);
         };
 
         // Server-triggered broadcast (from the host's REST call, not this
@@ -294,6 +311,10 @@ export const App: React.FC = () => {
     }
   };
 
+  // Host-only screen-share arbitration override — see WebRTCService.setPresentation.
+  const handleSetPresentation = (peerId: string) => {
+    webrtcService?.setPresentation(peerId);
+  };
 
   if (!inMeeting) {
     if (!sessionChecked) {
@@ -363,6 +384,9 @@ export const App: React.FC = () => {
           remoteMediaState={remoteMediaState}
           remoteStaleState={remoteStaleState}
           onRemoveParticipant={userRole === 'host' ? handleRemoveParticipant : undefined}
+          localPeerId={localPeerId}
+          activePresentation={activePresentation}
+          onSetPresentation={userRole === 'host' ? handleSetPresentation : undefined}
         />
 
         {/* Removal takeover notice: unlike a dropped connection, there's

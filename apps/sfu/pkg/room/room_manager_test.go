@@ -205,3 +205,101 @@ func TestRoomManager_CancelDisconnectOnReconnect(t *testing.T) {
 	_, exists := rm.GetParticipant(roomSlug, pID.String())
 	assert.True(t, exists, "Participant should remain in room after successful reconnect")
 }
+
+func TestRoomManager_ScreenShare_LatestSharePresentedByDefault(t *testing.T) {
+	ctx := context.Background()
+	rm := room.NewRoomManager(nil)
+	roomSlug := "screen-room"
+	hostID, _ := uuid.NewV7()
+	_, err := rm.CreateOrGetRoom(ctx, roomSlug, hostID.String())
+	require.NoError(t, err)
+
+	activeID, activeName, changed := rm.SetScreenSharing(roomSlug, "alice", "Alice", true)
+	assert.Equal(t, "alice", activeID)
+	assert.Equal(t, "Alice", activeName)
+	assert.True(t, changed)
+
+	// A second, later share must become active — "latest wins" — without
+	// evicting Alice's from the room's set of sharing publishers (she's
+	// suspended, not stopped).
+	activeID, activeName, changed = rm.SetScreenSharing(roomSlug, "bob", "Bob", true)
+	assert.Equal(t, "bob", activeID)
+	assert.Equal(t, "Bob", activeName)
+	assert.True(t, changed)
+
+	gotID, gotName, ok := rm.GetActivePresentation(roomSlug)
+	require.True(t, ok)
+	assert.Equal(t, "bob", gotID)
+	assert.Equal(t, "Bob", gotName)
+}
+
+func TestRoomManager_ScreenShare_StoppingActivePresenterClearsStage(t *testing.T) {
+	ctx := context.Background()
+	rm := room.NewRoomManager(nil)
+	roomSlug := "screen-room"
+	hostID, _ := uuid.NewV7()
+	_, _ = rm.CreateOrGetRoom(ctx, roomSlug, hostID.String())
+
+	rm.SetScreenSharing(roomSlug, "alice", "Alice", true)
+
+	activeID, activeName, changed := rm.SetScreenSharing(roomSlug, "alice", "Alice", false)
+	assert.Empty(t, activeID)
+	assert.Empty(t, activeName)
+	assert.True(t, changed)
+}
+
+func TestRoomManager_ScreenShare_StoppingASuspendedShareDoesNotClearStage(t *testing.T) {
+	ctx := context.Background()
+	rm := room.NewRoomManager(nil)
+	roomSlug := "screen-room"
+	hostID, _ := uuid.NewV7()
+	_, _ = rm.CreateOrGetRoom(ctx, roomSlug, hostID.String())
+
+	rm.SetScreenSharing(roomSlug, "alice", "Alice", true)
+	rm.SetScreenSharing(roomSlug, "bob", "Bob", true) // bob is now active; alice suspended
+
+	activeID, activeName, changed := rm.SetScreenSharing(roomSlug, "alice", "Alice", false)
+	assert.Equal(t, "bob", activeID, "stopping a suspended share must not disturb who's actually on stage")
+	assert.Equal(t, "Bob", activeName)
+	assert.True(t, changed, "the sharing publisher set itself did change, even though the stage didn't")
+}
+
+func TestRoomManager_ScreenShare_HostCanReclaimOwnSuspendedShare(t *testing.T) {
+	ctx := context.Background()
+	rm := room.NewRoomManager(nil)
+	roomSlug := "screen-room"
+	hostID, _ := uuid.NewV7()
+	_, _ = rm.CreateOrGetRoom(ctx, roomSlug, hostID.String())
+
+	rm.SetScreenSharing(roomSlug, hostID.String(), "Host", true)
+	rm.SetScreenSharing(roomSlug, "guest", "Guest", true) // suspends the host's share
+
+	// Host reclaims — this is literally the same mechanism a host would use
+	// to pick anyone else's active share; targeting their own ID is what
+	// "take back the presentation" means here.
+	name, ok := rm.SetActivePresentation(roomSlug, hostID.String())
+	assert.True(t, ok)
+	assert.Equal(t, "Host", name)
+
+	gotID, _, _ := rm.GetActivePresentation(roomSlug)
+	assert.Equal(t, hostID.String(), gotID)
+}
+
+func TestRoomManager_ScreenShare_SetActivePresentationRejectsNonPresentingTarget(t *testing.T) {
+	ctx := context.Background()
+	rm := room.NewRoomManager(nil)
+	roomSlug := "screen-room"
+	hostID, _ := uuid.NewV7()
+	_, _ = rm.CreateOrGetRoom(ctx, roomSlug, hostID.String())
+
+	rm.SetScreenSharing(roomSlug, "alice", "Alice", true)
+
+	// "carol" was never in the sharing set (stale ID, or never shared at
+	// all) — must be refused rather than putting an empty tile on stage.
+	name, ok := rm.SetActivePresentation(roomSlug, "carol")
+	assert.False(t, ok)
+	assert.Empty(t, name)
+
+	gotID, _, _ := rm.GetActivePresentation(roomSlug)
+	assert.Equal(t, "alice", gotID, "the rejected request must not have disturbed the actual stage")
+}

@@ -254,6 +254,64 @@ describe('WebRTCService Audit & Unit Tests', () => {
     expect(disconnectedCalled).toBe(false);
   });
 
+  test('incoming presentation_state triggers onPresentationStateChanged with raw peer id/name', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let received: any = null;
+    service.onPresentationStateChanged = (state) => {
+      received = state;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({
+      data: JSON.stringify({
+        type: 'presentation_state',
+        active_peer_id: 'user-uuid-4',
+        active_peer_name: 'Dana',
+      }),
+    });
+
+    expect(received).toEqual({ activePeerId: 'user-uuid-4', activePeerName: 'Dana' });
+  });
+
+  test('incoming presentation_state with no active presenter reports an empty peer id', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let received: any = null;
+    service.onPresentationStateChanged = (state) => {
+      received = state;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({
+      data: JSON.stringify({ type: 'presentation_state', active_peer_id: '', active_peer_name: '' }),
+    });
+
+    expect(received).toEqual({ activePeerId: '', activePeerName: '' });
+  });
+
+  test('setPresentation sends the host-override request with the target peer id', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const ws = (service as any).ws;
+    service.setPresentation('user-uuid-5');
+
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'set_presentation', peer_id: 'user-uuid-5' }));
+  });
+
+  test('setPresentation is a no-op without a peer id', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const ws = (service as any).ws;
+    service.setPresentation('');
+
+    expect(ws.send).not.toHaveBeenCalled();
+  });
+
   test('incoming recording_state triggers onRecordingStateChanged for every participant', async () => {
     const service = new WebRTCService('demo-room');
     await service.connectToken('mock-jwt-token');

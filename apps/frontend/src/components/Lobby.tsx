@@ -12,7 +12,7 @@ export function shouldAutoJoinEgress(role: string, roomSlug: string): boolean {
   return role === 'egress' && !!roomSlug.trim();
 }
 
-export type HostSession = Pick<SessionResponse, 'token' | 'name' | 'role'>;
+export type HostSession = Pick<SessionResponse, 'token' | 'name' | 'role' | 'user_id'>;
 
 interface LobbyProps {
   initialRoomSlug?: string;

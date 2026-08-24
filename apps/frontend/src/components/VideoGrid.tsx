@@ -16,6 +16,21 @@ interface VideoGridProps {
   // Host-only "remove participant" action. Present only for the host role;
   // undefined elsewhere so VideoTile never renders the control at all.
   onRemoveParticipant?: (rawPeerId: string) => void;
+  // This client's own raw participant ID — needed to tell whether
+  // activePresentation (below) is this client's own screen share or
+  // someone else's, since ParticipantTrack never carries an entry for the
+  // local user's own tracks.
+  localPeerId?: string;
+  // The room's server-arbitrated active screen share (BR: when multiple
+  // participants share at once, the latest is shown by default; others
+  // suspended, not dropped; host can pick or reclaim). null/undefined
+  // means nobody is presenting.
+  activePresentation?: { peerId: string; peerName: string } | null;
+  // Host-only screen-share arbitration override — pick any currently
+  // (possibly suspended) presenter, including the host's own suspended
+  // share, as the room's active presentation. Present only for the host
+  // role, matching onRemoveParticipant's contract.
+  onSetPresentation?: (peerId: string) => void;
 }
 
 export function getGridClass(totalTiles: number): string {
@@ -65,6 +80,49 @@ export function getInitials(name: string): string {
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
+// resolvePresentationView is the pure decision core of the screen-share
+// arbitration UI (BR: the latest simultaneous share wins by default;
+// others are suspended, not dropped; host can pick or reclaim). Pulled out
+// of the VideoGrid component so the "who's on stage, who's suspended, is
+// Stage Mode active at all" logic — the part most likely to hide a bug —
+// has direct unit tests instead of needing to render the component.
+export function resolvePresentationView(
+  uniqueTracks: ParticipantTrack[],
+  localPeerId: string | undefined,
+  isPresentingLocally: boolean,
+  activePeerId: string,
+  activePeerName: string
+): {
+  activeIsLocal: boolean;
+  activeRemoteTrack: ParticipantTrack | undefined;
+  suspendedRemoteScreens: ParticipantTrack[];
+  localSuspended: boolean;
+  stageModeActive: boolean;
+  presentationLabel: string;
+} {
+  const activeIsLocal = isPresentingLocally && !!localPeerId && activePeerId === localPeerId;
+  const activeRemoteTrack = activeIsLocal
+    ? undefined
+    : uniqueTracks.find((t) => t.isScreenShare && t.rawPeerId === activePeerId);
+  const suspendedRemoteScreens = uniqueTracks.filter(
+    (t) => t.isScreenShare && t.rawPeerId !== activePeerId
+  );
+  const localSuspended = isPresentingLocally && !activeIsLocal;
+  // Stage Mode triggers whenever anyone (including a suspended local
+  // share) is presenting — not only when a stream can already be
+  // resolved for it, since "I'm presenting but suspended" still needs the
+  // Stage Mode layout to show that state rather than silently reverting
+  // to the plain grid.
+  const stageModeActive = !!activePeerId || isPresentingLocally;
+  const presentationLabel = activeIsLocal
+    ? 'Your Screen Presentation'
+    : activeRemoteTrack
+      ? `${activePeerName || 'Presenter'}'s Presentation`
+      : 'Presentation Screen';
+
+  return { activeIsLocal, activeRemoteTrack, suspendedRemoteScreens, localSuspended, stageModeActive, presentationLabel };
+}
+
 export function deriveVisibility(
   isMicMuted: boolean | undefined,
   isCamOff: boolean | undefined,
@@ -100,7 +158,16 @@ const VideoTile: React.FC<{
   // control never renders for guests or for tiles metadata hasn't caught
   // up with yet.
   onRemove?: () => void;
-}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove }) => {
+  // True for a screen share that's currently live but not the room's
+  // active presentation (BR: the latest share wins by default; others are
+  // suspended, not dropped, so the host can still choose to show them).
+  isSuspended?: boolean;
+  // Host-only "make this the active presentation" action for a suspended
+  // share — present only for the host role, undefined for anyone else
+  // (including for the presenter reclaiming their own suspended share:
+  // that's a host-only action too, per BR).
+  onPromote?: () => void;
+}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove, isSuspended, onPromote }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
@@ -169,6 +236,23 @@ const VideoTile: React.FC<{
         </div>
       )}
 
+      {/* Suspended-presentation overlay: this share is still live, just not
+          what the room is currently shown — persistent (not hover-only)
+          since it's meaningful state, not a transient action affordance. */}
+      {isSuspended && (
+        <div className="absolute inset-0 bg-slate-950/60 flex flex-col items-center justify-center gap-2 z-10 select-none px-3 text-center">
+          <span className="text-[11px] font-medium text-slate-300 tracking-wide">Presentation suspended</span>
+          {onPromote && (
+            <button
+              onClick={onPromote}
+              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-medium rounded-lg shadow-lg shadow-indigo-600/30 transition-colors"
+            >
+              Show to Everyone
+            </button>
+          )}
+        </div>
+      )}
+
       {onRemove && (
         <button
           onClick={onRemove}
@@ -222,17 +306,29 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   remoteMediaState,
   remoteStaleState,
   onRemoveParticipant,
+  localPeerId,
+  activePresentation,
+  onSetPresentation,
 }) => {
   const uniqueTracks = deduplicateTracks(remoteTracks);
-  const remoteScreenTrack = uniqueTracks.find((t) => t.isScreenShare);
   const isEgress = userRole === 'egress';
   const isHost = userRole === 'host';
 
-  const activePresentationStream = localScreenStream || remoteScreenTrack?.stream;
-  const presentationLabel = localScreenStream ? 'Your Screen Presentation' : 'Presentation Screen';
-  // Only offer removal on the presentation tile when it's actually someone
-  // else's screen — localScreenStream means it's the current user's own.
-  const presentingRemoteTrack = !localScreenStream ? remoteScreenTrack : undefined;
+  // BR: multiple simultaneous screen shares are arbitrated server-side
+  // (see RoomManager.SetScreenSharing / signaling's set_presentation) —
+  // activePresentation names the one the whole room actually sees;
+  // everything else live is "suspended," not dropped.
+  const isPresentingLocally = !!localScreenStream;
+  const activePeerId = activePresentation?.peerId || '';
+  const {
+    activeIsLocal,
+    activeRemoteTrack,
+    suspendedRemoteScreens,
+    localSuspended,
+    stageModeActive,
+    presentationLabel,
+  } = resolvePresentationView(uniqueTracks, localPeerId, isPresentingLocally, activePeerId, activePresentation?.peerName || '');
+  const activePresentationStream = activeIsLocal ? localScreenStream : activeRemoteTrack?.stream;
 
   const localLabel = displayName ? `${displayName} (You)` : `You (${userRole})`;
 
@@ -243,12 +339,19 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   const removeHandlerFor = (track: ParticipantTrack): (() => void) | undefined =>
     isHost && track.rawPeerId ? () => onRemoveParticipant?.(track.rawPeerId) : undefined;
 
-  // BR4: Stage Mode rendering when screen track or out-of-band metadata screen track is active.
-  // Tiles fill their allotted space instead of scrolling: a fixed egress
-  // viewport (Puppeteer recording this page) can never scroll, so anything
-  // that overflowed here would simply be missing from the recording.
-  if (activePresentationStream) {
-    const sidebarTracks = uniqueTracks.filter((t) => !t.isScreenShare);
+  // Host-only "show to everyone" for a suspended share — matches
+  // removeHandlerFor's undefined-when-not-applicable contract.
+  const promoteHandlerFor = (peerId: string): (() => void) | undefined =>
+    isHost && peerId ? () => onSetPresentation?.(peerId) : undefined;
+
+  // BR4/arbitration: Stage Mode rendering when a screen share (active or
+  // suspended) exists anywhere in the room. Tiles fill their allotted
+  // space instead of scrolling: a fixed egress viewport (Puppeteer
+  // recording this page) can never scroll, so anything that overflowed
+  // here would simply be missing from the recording.
+  if (stageModeActive) {
+    const sidebarCameraTracks = uniqueTracks.filter((t) => !t.isScreenShare);
+
     return (
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 h-[calc(100vh-80px)] overflow-hidden">
         <div className="lg:col-span-3 h-full min-h-0">
@@ -256,8 +359,8 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
             stream={activePresentationStream}
             label={presentationLabel}
             isScreen
-            isStale={presentingRemoteTrack ? remoteStaleState?.get(presentingRemoteTrack.peerID) : undefined}
-            onRemove={presentingRemoteTrack ? removeHandlerFor(presentingRemoteTrack) : undefined}
+            isStale={activeRemoteTrack ? remoteStaleState?.get(activeRemoteTrack.peerID) : undefined}
+            onRemove={activeRemoteTrack ? removeHandlerFor(activeRemoteTrack) : undefined}
           />
         </div>
         <div className="flex flex-col gap-3 h-full min-h-0 overflow-hidden">
@@ -266,7 +369,32 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
               <VideoTile stream={localStream} label={localLabel} />
             </div>
           )}
-          {sidebarTracks.map((track) => {
+
+          {localSuspended && (
+            <div className="flex-1 min-h-0">
+              <VideoTile
+                stream={localScreenStream}
+                label="Your Screen"
+                isScreen
+                isSuspended
+                onPromote={promoteHandlerFor(localPeerId || '')}
+              />
+            </div>
+          )}
+
+          {suspendedRemoteScreens.map((track) => (
+            <div key={track.id} className="flex-1 min-h-0">
+              <VideoTile
+                stream={track.stream}
+                label={`${track.peerID.slice(0, 12)}'s Screen`}
+                isScreen
+                isSuspended
+                onPromote={promoteHandlerFor(track.rawPeerId)}
+              />
+            </div>
+          ))}
+
+          {sidebarCameraTracks.map((track) => {
             // undefined (no signal received yet) must stay undefined, not
             // collapse to false, so VideoTile falls back to the track-based
             // heuristic instead of forcing "not muted"/"camera on".

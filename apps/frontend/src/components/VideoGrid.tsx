@@ -246,7 +246,7 @@ const VideoTile: React.FC<{
   const { showVideoFallback, showMicMuted } = deriveVisibility(isMicMuted, isCamOff, hasAudio, hasVideo, !!stream, !!isScreen);
 
   return (
-    <div className="group relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center w-full h-full">
+    <div data-testid="video-tile" className="group relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center w-full h-full">
       <video
         ref={videoRef}
         autoPlay

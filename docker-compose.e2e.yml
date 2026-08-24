@@ -1,0 +1,41 @@
+# Override for docker-compose.yml used ONLY by the L3 Playwright E2E suite
+# (see e2e/) and CI's test-e2e job — never referenced by a normal
+# `docker-compose up`.
+#
+# docker-compose.yml's sfu-backend/frontend/egress-worker deliberately use
+# `image: azharfa/naka-meet-*:latest` (pre-built, pulled from Docker Hub) —
+# correct for a production deploy, but wrong for E2E: it would test
+# whatever was last pushed to :latest, not the code actually being changed
+# in the current branch/PR. Adding `build:` here alongside the base file's
+# `image:` is standard Compose behavior: `docker-compose ... up --build`
+# builds fresh from source and tags the result with that same image name
+# locally, so nothing is pulled from Docker Hub and the running stack is
+# always this branch's actual code.
+#
+# Also points every service's env_file at .env.e2e instead of the base
+# file's .env — Compose replaces (not merges) an overridden env_file list,
+# so this never touches a developer's real local .env, and CI never needs
+# one either.
+services:
+  postgres:
+    env_file:
+      - .env.e2e
+
+  sfu-backend:
+    build:
+      context: ./apps/sfu
+      dockerfile: Dockerfile
+    env_file:
+      - .env.e2e
+
+  frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile
+
+  egress-worker:
+    build:
+      context: ./apps/egress
+      dockerfile: Dockerfile
+    env_file:
+      - .env.e2e

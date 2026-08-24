@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/mail"
@@ -100,6 +101,10 @@ func (h *APIHandler) isAllowedOrigin(origin string) bool {
 			return true
 		}
 	}
+	// Same rationale as signaling.Handler.isAllowedOrigin: a mismatched
+	// ALLOWED_ORIGINS entry silently drops every REST response's CORS
+	// headers with no server-side trace otherwise.
+	log.Printf("api: rejected CORS origin %q (allowed: %v)", origin, h.allowedOrigins)
 	return false
 }
 

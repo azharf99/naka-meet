@@ -38,7 +38,13 @@ export class WebRTCService {
   public onMessageReceived?: MessageCallback;
   public onMediaStateChanged?: MediaStateCallback;
   public onRecordingStateChanged?: RecordingStateCallback;
-  public onDisconnected?: () => void;
+  // wasConnected distinguishes a mid-call drop (WS reached `open` at least
+  // once) from a connection that was refused outright — most commonly the
+  // signaling WS being 403'd at upgrade because this origin isn't in the
+  // server's ALLOWED_ORIGINS allowlist. Both look identical to the browser
+  // (onclose fires either way) but call for very different user-facing
+  // messages, so the distinction has to be tracked here.
+  public onDisconnected?: (wasConnected: boolean) => void;
 
   constructor(private roomSlug: string) {}
 
@@ -169,8 +175,10 @@ export class WebRTCService {
     const wsURL = `${wsProtocol}//${wsHost}/ws/signaling?room_slug=${this.roomSlug}&token=${encodeURIComponent(token)}`;
 
     this.ws = new WebSocket(wsURL);
+    let wsDidOpen = false;
 
     this.ws.onopen = async () => {
+      wsDidOpen = true;
       try {
         if (this.pc && this.ws && (this.ws.readyState === 1 || this.ws.readyState === WebSocket.OPEN)) {
           if (this.pc.signalingState === 'stable') {
@@ -188,7 +196,7 @@ export class WebRTCService {
     };
 
     this.ws.onclose = () => {
-      if (this.onDisconnected) this.onDisconnected();
+      if (this.onDisconnected) this.onDisconnected(wsDidOpen);
     };
     this.ws.onerror = (err) => {
       console.error('Signaling WebSocket error', err);

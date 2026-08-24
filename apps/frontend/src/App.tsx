@@ -22,6 +22,7 @@ export const App: React.FC = () => {
   const [remoteTracks, setRemoteTracks] = useState<ParticipantTrack[]>([]);
   const [remoteMediaState, setRemoteMediaState] = useState<Map<string, { mic: boolean; cam: boolean }>>(new Map());
   const [connectionLost, setConnectionLost] = useState(false);
+  const [connectionRejected, setConnectionRejected] = useState(false);
   const [recordingConsent, setRecordingConsent] = useState<{ active: boolean; kind: string } | null>(null);
 
   const [chatOpen, setChatOpen] = useState(false);
@@ -80,6 +81,12 @@ export const App: React.FC = () => {
       }
       setSessionChecked(true);
     });
+    // urlParams is rebuilt fresh from window.location.search on every render
+    // (not memoized) and this effect must run exactly once on mount to
+    // resolve the initial "is there a restorable host session" state —
+    // adding it to the deps array would make a new URLSearchParams object
+    // identity re-trigger the effect on every render instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -88,6 +95,11 @@ export const App: React.FC = () => {
     if (roleParam === 'egress' && roomParam && !inMeeting) {
       handleJoinRoom('Egress Recorder', roomParam, 'egress');
     }
+    // Same rationale as above for urlParams; inMeeting is read here only to
+    // guard against re-joining if this ever re-ran, not to react to it —
+    // including it would turn "auto-join once as the egress bot" into
+    // "auto-join again every time the meeting is left."
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
 
@@ -99,6 +111,8 @@ export const App: React.FC = () => {
     setIsScreenSharing(false);
     setRemoteTracks([]);
     setMessages([]);
+    setConnectionLost(false);
+    setConnectionRejected(false);
     setInMeeting(false);
     window.history.pushState({}, '', window.location.pathname);
   };
@@ -154,8 +168,13 @@ export const App: React.FC = () => {
           });
         };
 
-        service.onDisconnected = () => {
+        service.onDisconnected = (wasConnected) => {
           setConnectionLost(true);
+          // The WS never reached `open` at all — almost always this origin
+          // isn't in the server's ALLOWED_ORIGINS allowlist (e.g. joining
+          // via a LAN IP or 127.0.0.1 that isn't listed), not a mid-call
+          // network drop. Worth a distinct message: "reload" doesn't fix it.
+          setConnectionRejected(!wasConnected);
         };
 
         // Server-triggered broadcast (from the host's REST call, not this
@@ -294,7 +313,9 @@ export const App: React.FC = () => {
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2">
           {connectionLost && (
             <div className="px-4 py-2 bg-red-500/90 text-white text-xs font-medium rounded-lg shadow-lg backdrop-blur-md">
-              Connection lost — please reload to rejoin.
+              {connectionRejected
+                ? "Couldn't connect — this address isn't allowed by the server. Ask the host to add it to ALLOWED_ORIGINS."
+                : 'Connection lost — please reload to rejoin.'}
             </div>
           )}
 

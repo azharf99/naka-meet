@@ -119,7 +119,7 @@ jobs:
   # test jobs so an obviously broken PR fails fast without paying for a
   # full docker build + browser install first.
   test-e2e:
-    name: Test — L3 Multi-Browser E2E
+    name: Test — L3/L4 E2E (multi-browser + recording)
     runs-on: ubuntu-latest
     needs: [test-sfu, test-frontend, test-egress]
     steps:
@@ -135,6 +135,19 @@ jobs:
       # files identical so it can't matter either way.
       - name: Provide .env for compose (mirrors .env.e2e)
         run: cp .env.e2e .env
+
+      # egress-worker bind-mounts ./recordings — creating it ourselves
+      # first (rather than letting Docker auto-create it on first mount)
+      # guarantees the runner user owns it, so L4's test can read the
+      # produced .mp4 back out after the container writes it as root.
+      - name: Create recordings directory
+        run: mkdir -p recordings
+
+      # L4 needs ffprobe to inspect the recording's actual duration/streams
+      # (see e2e/tests/recording.spec.ts) — not assumed present on the
+      # runner image.
+      - name: Install ffmpeg (for ffprobe)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Build stack from source (not :latest)
         run: docker compose -p naka-meet-e2e -f docker-compose.yml -f docker-compose.e2e.yml build

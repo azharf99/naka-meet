@@ -34,6 +34,30 @@ jobs:
         working-directory: apps/sfu
         run: go test -v -race ./...
 
+  # TESTING_STRATEGY.md §5's L2 layer: a real Redis container (via
+  # Testcontainers) behind RoomManager, and a real SDP offer/answer over the
+  # live /ws/signaling endpoint — every other Go test in this repo passes
+  # room.NewRoomManager(nil), which skips the Redis mirroring code path
+  # entirely, so this is the only test that would ever catch a regression
+  # there. Gated behind -tags=integration and its own job (rather than folded
+  # into test-sfu above) because it needs a reachable Docker daemon — ubuntu-
+  # latest GH-hosted runners have one natively, no extra setup required.
+  test-sfu-integration:
+    name: Test — Go SFU Integration (real Redis)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/sfu/go.mod
+
+      - name: go test -tags=integration
+        working-directory: apps/sfu
+        run: go test -tags=integration -run TestIntegration -v ./...
+
   test-frontend:
     name: Test — Frontend
     runs-on: ubuntu-latest
@@ -89,7 +113,7 @@ jobs:
   build-and-deploy:
     name: Build Image and Deploy to VPS
     runs-on: ubuntu-latest
-    needs: [test-sfu, test-frontend, test-egress]
+    needs: [test-sfu, test-sfu-integration, test-frontend, test-egress]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     if: github.ref == 'refs/heads/main' # Hanya jalankan saat push ke main, setelah semua test lulus

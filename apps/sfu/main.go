@@ -112,6 +112,14 @@ func main() {
 	// So the host-only "mute participant" REST endpoint (BR1) can actually
 	// reach them.
 	apiHandler.SetParticipantMuter(signalingHandler.ForceMuteParticipant)
+	// TURN_SECRET empty (the default) leaves /api/v1/ice-servers returning
+	// STUN-only — opt-in, not a hard requirement for a deployment that
+	// hasn't set up the coturn service (docker-compose.yml's "turn"
+	// profile). Without a TURN server, participants on restrictive/
+	// symmetric NAT (common on mobile carriers and corporate networks)
+	// silently can't connect at all — invisible on a single LAN, which is
+	// exactly why this class of gap is easy to ship without noticing.
+	apiHandler.SetTurnConfig(os.Getenv("TURN_SECRET"), os.Getenv("TURN_HOST"), os.Getenv("TURN_PORT"))
 
 	mux := http.NewServeMux()
 

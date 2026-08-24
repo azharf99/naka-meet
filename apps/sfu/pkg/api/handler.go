@@ -16,6 +16,7 @@ import (
 	"github.com/naka-meet/sfu/pkg/auth"
 	"github.com/naka-meet/sfu/pkg/db"
 	"github.com/naka-meet/sfu/pkg/room"
+	"github.com/naka-meet/sfu/pkg/turn"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 )
@@ -58,6 +59,14 @@ type APIHandler struct {
 	// RoomManager bookkeeping, not the live WebSocket connection needed to
 	// tell the target's own client to mute itself.
 	participantMuter func(roomSlug, participantID string) bool
+
+	// TURN config for /api/v1/ice-servers — see SetTurnConfig. turnSecret
+	// empty means TURN isn't configured for this deployment; the endpoint
+	// then returns STUN-only, matching the app's original hardcoded
+	// behavior, so this feature is opt-in and never a hard requirement.
+	turnSecret string
+	turnHost   string
+	turnPort   string
 
 	authLimiters  map[string]*rate.Limiter
 	authLimiterMu sync.Mutex
@@ -117,6 +126,19 @@ func (h *APIHandler) SetParticipantRemover(fn func(roomSlug, participantID, reas
 // participant" endpoint below can actually reach them — BR1.
 func (h *APIHandler) SetParticipantMuter(fn func(roomSlug, participantID string) bool) {
 	h.participantMuter = fn
+}
+
+// SetTurnConfig wires the shared secret and reachable host:port a coturn
+// server (see docker-compose.yml's optional "turn" profile) was configured
+// with, so /api/v1/ice-servers can hand out time-limited TURN credentials
+// (pkg/turn's coturn REST API scheme) instead of STUN-only. Passing an
+// empty secret leaves TURN disabled — intentionally the default, since a
+// deployment that hasn't set up coturn shouldn't have this endpoint start
+// erroring or handing out useless credentials.
+func (h *APIHandler) SetTurnConfig(secret, host, port string) {
+	h.turnSecret = secret
+	h.turnHost = host
+	h.turnPort = port
 }
 
 // SetUserStoreForTesting overrides the user store (e.g. with an in-memory
@@ -244,6 +266,14 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 5. Logout
 	if path == "/api/v1/auth/logout" && r.Method == http.MethodPost {
 		h.handleLogout(w, r)
+		return
+	}
+
+	// 5b. ICE server list (STUN, plus time-limited TURN credentials when
+	// coturn is configured) — any authenticated session, not host-only,
+	// since every participant needs this to even attempt to connect.
+	if path == "/api/v1/ice-servers" && r.Method == http.MethodGet {
+		h.handleIceServers(w, r)
 		return
 	}
 
@@ -657,6 +687,61 @@ func (h *APIHandler) handleMuteParticipant(w http.ResponseWriter, r *http.Reques
 		"room":           roomSlug,
 		"participant_id": participantID,
 	})
+}
+
+// iceServer mirrors the shape the browser's RTCPeerConnection constructor
+// expects for its iceServers config — urls, plus username/credential for
+// entries that need them (TURN; STUN never does).
+type iceServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+// turnCredentialTTL bounds how long a handed-out TURN credential keeps
+// working. Long enough that a call in progress never has its relay path
+// invalidated mid-meeting (WebRTC doesn't re-authenticate an
+// already-established TURN allocation), short enough that a credential
+// leaked from a browser's devtools network tab isn't useful for long.
+const turnCredentialTTL = 12 * time.Hour
+
+// handleIceServers returns this deployment's STUN (and, if coturn is
+// configured — see SetTurnConfig — time-limited TURN) server list. Any
+// authenticated session may call this, not just hosts: STUN-only silently
+// strands anyone whose network needs a relay (symmetric NAT, restrictive
+// corporate firewalls, most mobile carrier NAT) — invisible on a single
+// LAN, which is exactly why this class of failure is easy to ship without
+// noticing.
+func (h *APIHandler) handleIceServers(w http.ResponseWriter, r *http.Request) {
+	claims := h.extractAndValidateToken(r)
+	if claims == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	servers := []iceServer{
+		{URLs: []string{"stun:stun.l.google.com:19302"}},
+	}
+
+	if h.turnSecret != "" && h.turnHost != "" {
+		port := h.turnPort
+		if port == "" {
+			port = "3478"
+		}
+		username, password := turn.GenerateCredentials(h.turnSecret, claims.UserID, turnCredentialTTL, time.Now())
+		hostPort := h.turnHost + ":" + port
+		servers = append(servers,
+			iceServer{URLs: []string{"stun:" + hostPort}},
+			iceServer{
+				URLs:       []string{"turn:" + hostPort + "?transport=udp", "turn:" + hostPort + "?transport=tcp"},
+				Username:   username,
+				Credential: password,
+			},
+		)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"iceServers": servers})
 }
 
 func (h *APIHandler) handleGetRoom(w http.ResponseWriter, r *http.Request) {

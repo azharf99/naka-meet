@@ -91,6 +91,43 @@ services:
           cpus: '1.5'
           memory: 1G
 
+  # Optional TURN relay for participants whose network needs one (symmetric
+  # NAT, most mobile carriers, restrictive corporate firewalls) — STUN
+  # alone silently strands them, invisible when everyone testing is on the
+  # same LAN. Opt-in via a Compose profile so a plain `docker-compose up`
+  # never starts it or opens its ports: `docker-compose --profile turn up
+  # --build`. Requires TURN_SECRET (and, for a real deployment,
+  # TURN_EXTERNAL_IP) set in .env — see .env.example.
+  turn:
+    image: coturn/coturn:latest
+    container_name: naka-turn
+    profiles: ["turn"]
+    env_file:
+      - .env
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      # Relay port range coturn allocates a real UDP port from per active
+      # relayed stream — kept modest for a single-VPS deployment. Widen if
+      # many participants are simultaneously behind NATs that need relaying.
+      - "49160-49200:49160-49200/udp"
+    # $$ (not $) so Compose leaves these for the container's own shell to
+    # expand at runtime from env_file's real values, instead of Compose
+    # trying to interpolate them itself at compose-file parse time.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        exec turnserver -n --log-file=stdout
+        --realm=$${TURN_REALM:-naka-meet.local}
+        --use-auth-secret
+        --static-auth-secret=$$TURN_SECRET
+        --min-port=49160 --max-port=49200
+        --no-cli --no-tls --no-dtls
+        --listening-port=3478
+        $${TURN_EXTERNAL_IP:+--external-ip=$$TURN_EXTERNAL_IP}
+    networks:
+      - naka_network
+
 networks:
   naka_network:
     driver: bridge

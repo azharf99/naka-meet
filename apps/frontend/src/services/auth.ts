@@ -20,6 +20,16 @@ export interface RoomInfoResponse {
   participant_count: number;
 }
 
+export interface IceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+export interface IceServersResponse {
+  iceServers: IceServer[];
+}
+
 async function parseErrorMessage(res: Response, fallback: string): Promise<string> {
   const text = await res.text().catch(() => '');
   return text.trim() || fallback;
@@ -102,6 +112,23 @@ export async function getRoomInfo(slug: string): Promise<RoomInfoResponse> {
   const res = await fetch(`/api/v1/rooms/${encodeURIComponent(slug)}`);
   if (!res.ok) {
     throw new Error('Room not found');
+  }
+  return res.json();
+}
+
+// Returns this deployment's STUN (and, if the operator has configured
+// coturn — see .env.example — time-limited TURN) server list. STUN alone
+// silently strands any participant whose network needs a relay (symmetric
+// NAT, most mobile carriers, restrictive corporate firewalls); invisible
+// on a single LAN, which is exactly why this class of failure is easy to
+// ship without noticing.
+export async function getIceServers(token: string): Promise<IceServersResponse> {
+  const res = await fetch('/api/v1/ice-servers', {
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    throw new Error('Failed to fetch ICE server configuration');
   }
   return res.json();
 }

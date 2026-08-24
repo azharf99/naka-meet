@@ -70,6 +70,16 @@ describe('WebRTC Service Renegotiation and Ontrack Registration Tests', () => {
         }),
       },
     });
+    // connectToken fetches this deployment's ICE server list — stub it so
+    // these tests exercise the fallback path deterministically rather than
+    // Node's real fetch failing on a relative URL with no page origin.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }),
+      })
+    );
   });
 
   test('Polite peer rolls back local description during remote offer glare', async () => {

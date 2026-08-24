@@ -201,18 +201,78 @@ func TestAPI_GuestJoin_IgnoresClientSuppliedHostRole(t *testing.T) {
 	resp := w.Result()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var jwtCookie *http.Cookie
-	for _, c := range resp.Cookies() {
-		if c.Name == "jwt_token" {
-			jwtCookie = c
-		}
-	}
-	require.NotNil(t, jwtCookie)
+	// Guest joins hand the token back in the JSON body only — see
+	// TestAPI_GuestJoin_DoesNotSetSessionCookie for why they must not also
+	// set the jwt_token cookie.
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.NotEmpty(t, body["token"])
 
-	claims, err := auth.ValidateToken(jwtCookie.Value, secret)
+	claims, err := auth.ValidateToken(body["token"], secret)
 	require.NoError(t, err)
 	assert.Equal(t, "guest", claims.Role)
 	assert.Equal(t, "Budi", claims.Name)
+}
+
+// TestAPI_GuestJoin_DoesNotSetSessionCookie is the regression test for the
+// cross-tab session hijack bug: a guest/egress join used to call
+// issueSession the same way host signup/login does, setting the site-wide
+// jwt_token cookie. Because browsers share one cookie jar per origin across
+// tabs, a guest joining in tab B silently overwrote the host's jwt_token
+// cookie from tab A. extractAndValidateToken prefers the cookie over the
+// Authorization header, so the host's own next REST call (e.g. "Record")
+// got authenticated as the guest and 403'd — even though the host's React
+// state still held a perfectly valid host token. Guests never rely on the
+// cookie (guestJoin() in the frontend reads the token from the JSON body,
+// and getSession()'s cookie-restore flow is gated to role === "host"), so
+// the fix is to simply never set it for guest/egress sessions.
+func TestAPI_GuestJoin_DoesNotSetSessionCookie(t *testing.T) {
+	secret := []byte("api-secret-key")
+	handler := api.NewAPIHandler(secret, nil)
+
+	reqBody := `{"name":"Budi","room_slug":"demo-room","role":"guest"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/guest", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	resp := w.Result()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	for _, c := range resp.Cookies() {
+		assert.NotEqual(t, "jwt_token", c.Name, "guest join must not set/overwrite the jwt_token cookie shared with the host's tab")
+	}
+}
+
+// TestAPI_GuestJoin_DoesNotClobberHostSessionCookie simulates the exact
+// two-tab scenario: a host's tab_A response already carries a jwt_token
+// cookie, then a guest joins from tab_B against the same handler instance.
+// The guest response must not carry a Set-Cookie for jwt_token that would
+// overwrite tab_A's cookie in a shared browser cookie jar.
+func TestAPI_GuestJoin_DoesNotClobberHostSessionCookie(t *testing.T) {
+	secret := []byte("api-secret-key")
+	handler, _ := newHandlerWithUserStore(secret)
+
+	signupReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/signup", strings.NewReader(
+		`{"name":"Alice","email":"alice@example.com","password":"correct-password-123"}`))
+	signupW := httptest.NewRecorder()
+	handler.ServeHTTP(signupW, signupReq)
+
+	var hostCookie *http.Cookie
+	for _, c := range signupW.Result().Cookies() {
+		if c.Name == "jwt_token" {
+			hostCookie = c
+		}
+	}
+	require.NotNil(t, hostCookie, "host signup must set the jwt_token cookie")
+
+	guestReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/guest", strings.NewReader(
+		`{"name":"Budi","room_slug":"demo-room","role":"guest"}`))
+	guestW := httptest.NewRecorder()
+	handler.ServeHTTP(guestW, guestReq)
+
+	for _, c := range guestW.Result().Cookies() {
+		assert.NotEqual(t, "jwt_token", c.Name, "guest join in a second tab must not overwrite the host's jwt_token cookie")
+	}
 }
 
 func TestAPI_GuestJoin_AllowsEgressRole(t *testing.T) {

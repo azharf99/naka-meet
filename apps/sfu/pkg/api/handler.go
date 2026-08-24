@@ -321,7 +321,7 @@ func (h *APIHandler) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.issueSession(w, userID.String(), name, "host")
+	h.issueSession(w, userID.String(), name, "host", true)
 }
 
 func (h *APIHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -352,7 +352,7 @@ func (h *APIHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.issueSession(w, user.ID, user.Name, "host")
+	h.issueSession(w, user.ID, user.Name, "host", true)
 }
 
 func (h *APIHandler) handleGuestJoin(w http.ResponseWriter, r *http.Request) {
@@ -377,7 +377,9 @@ func (h *APIHandler) handleGuestJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.issueSession(w, userID.String(), name, role)
+	// Guest/egress sessions never touch the jwt_token cookie — see the
+	// setCookie doc comment on issueSession for why.
+	h.issueSession(w, userID.String(), name, role, false)
 }
 
 func (h *APIHandler) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -413,21 +415,34 @@ func (h *APIHandler) handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *APIHandler) issueSession(w http.ResponseWriter, userID, name, role string) {
+// issueSession mints a JWT and returns it in the response body. setCookie
+// controls whether it also sets the site-wide jwt_token cookie: that cookie
+// is how a host's session survives a page reload (see handleMe / the
+// frontend's getSession(), which only restores role === "host" sessions).
+// Guest/egress joins have no such restore path — guestJoin() in the
+// frontend only ever reads the token from the JSON body — so they must NOT
+// set this cookie. The browser's cookie jar is shared across tabs on the
+// same origin; a guest join in one tab setting this cookie silently
+// overwrites the host's session cookie in every other tab, and
+// extractAndValidateToken prefers the cookie over the Authorization header,
+// so the host's own subsequent requests get authenticated as the guest.
+func (h *APIHandler) issueSession(w http.ResponseWriter, userID, name, role string, setCookie bool) {
 	tokenStr, err := auth.GenerateTokenWithName(userID, name, role, h.jwtSecret, 24*time.Hour)
 	if err != nil {
 		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "jwt_token",
-		Value:    tokenStr,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   h.secureCookies,
-	})
+	if setCookie {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "jwt_token",
+			Value:    tokenStr,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   h.secureCookies,
+		})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{

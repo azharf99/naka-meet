@@ -65,8 +65,50 @@ function buildFFmpegArgs(roomSlug, outputUrl = 'output.mp4', options = {}) {
   ];
 }
 
+// waitForEgressReady polls the page for window.__egressReady (set by the
+// frontend's App.tsx once a real remote track has rendered, or after its
+// own bounded grace timeout if the room is genuinely still empty — see
+// App.tsx) instead of trusting Puppeteer's page.goto({waitUntil:
+// 'networkidle2'}) to mean "ready to record". networkidle2 only tracks
+// HTTP requests settling; it resolves as soon as the page's initial JS/CSS
+// quiet down, which is well before the signaling WebSocket has joined the
+// room, exchanged SDP, and rendered a single remote track — so without
+// this, FFmpeg's x11grab starts capturing the empty lobby and stays behind
+// that curve for however long the real handshake takes.
+//
+// page only needs an `evaluate` method (duck-typed against Puppeteer's
+// Page), so this is directly unit-testable with a trivial mock instead of
+// a real browser — per TESTING_STRATEGY.md, never a real Puppeteer/FFmpeg
+// process in a unit test. Returns false (not a throw) on timeout, since a
+// frontend bug here should degrade to "start recording anyway" rather than
+// block a recording indefinitely.
+async function waitForEgressReady(page, { timeoutMs = 15000, pollIntervalMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let ready = false;
+    try {
+      ready = await page.evaluate(() => !!window.__egressReady);
+    } catch (e) {
+      // page.evaluate can throw if the page navigated or closed mid-poll —
+      // treat as not-ready-yet rather than crashing the recording start.
+    }
+    if (ready) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
 class EgressWorker {
-  constructor({ redisClient, redisPubClient, onCommand, logStderr } = {}) {
+  constructor({
+    redisClient,
+    redisPubClient,
+    onCommand,
+    logStderr,
+    egressReadyTimeoutMs = 15000,
+    egressReadyPollMs = 250,
+  } = {}) {
+    this.egressReadyTimeoutMs = egressReadyTimeoutMs;
+    this.egressReadyPollMs = egressReadyPollMs;
     const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
     this.redisClient = redisClient || new Redis(redisUrl);
     // Connection in subscriber mode cannot be used for publish commands in ioredis.
@@ -150,9 +192,24 @@ class EgressWorker {
       });
 
       const page = await this.browser.newPage();
+      let pageLoaded = true;
       await page.goto(targetUrl, { waitUntil: 'networkidle2' }).catch(() => {
+        pageLoaded = false;
         console.warn(`Could not reach ${targetUrl}, rendering browser viewport on :99`);
       });
+
+      if (pageLoaded) {
+        console.log('⏳ Waiting for egress page readiness signal before starting FFmpeg...');
+        const ready = await waitForEgressReady(page, {
+          timeoutMs: this.egressReadyTimeoutMs,
+          pollIntervalMs: this.egressReadyPollMs,
+        }).catch(() => false);
+        if (ready) {
+          console.log('✅ Egress page signaled ready — starting capture');
+        } else {
+          console.warn(`⚠️ Egress page did not signal readiness within ${this.egressReadyTimeoutMs}ms — starting capture anyway`);
+        }
+      }
     } catch (err) {
       console.warn('Puppeteer launch skipped or failed, proceeding with screen capture:', err.message);
     }
@@ -240,5 +297,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = { EgressWorker, buildFFmpegArgs, resolveOutputPath };
+module.exports = { EgressWorker, buildFFmpegArgs, resolveOutputPath, waitForEgressReady };
 

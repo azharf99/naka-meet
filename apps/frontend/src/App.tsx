@@ -6,6 +6,13 @@ import { Controls } from './components/Controls';
 import { Lobby, HostSession } from './components/Lobby';
 import { Send, X, ShieldCheck, UserCheck, LogOut, UserX } from 'lucide-react';
 
+// How long the egress worker's readiness poll (apps/egress/worker.js's
+// waitForEgressReady) is willing to wait for a real participant to show up
+// before starting FFmpeg on a genuinely empty room anyway. Kept in sync
+// with — but independent of — that poll's own timeoutMs: this is the
+// condition that flips window.__egressReady, not the poll itself.
+const EGRESS_READY_GRACE_MS = 8000;
+
 export const App: React.FC = () => {
   const urlParams = new URLSearchParams(window.location.search);
   const initialRoomFromUrl = urlParams.get('room') || '';
@@ -245,6 +252,25 @@ export const App: React.FC = () => {
       activeService?.disconnect();
     };
   }, [inMeeting, token, roomSlug]);
+
+  // Signals the egress worker (apps/egress/worker.js's waitForEgressReady)
+  // that it's safe to start FFmpeg: either a real remote track has already
+  // rendered, or — if the room is genuinely still empty — a bounded grace
+  // period has elapsed so the recording isn't blocked from starting at
+  // all. Never reset back to false once set; a participant leaving later
+  // shouldn't make an already-running recording look "not ready" again.
+  useEffect(() => {
+    if (userRole !== 'egress' || !inMeeting) return;
+    const markReady = () => {
+      (window as unknown as { __egressReady?: boolean }).__egressReady = true;
+    };
+    if (remoteTracks.length > 0) {
+      markReady();
+      return;
+    }
+    const timer = setTimeout(markReady, EGRESS_READY_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, [userRole, inMeeting, remoteTracks.length]);
 
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();

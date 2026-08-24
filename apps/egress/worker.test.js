@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const RedisMock = require('ioredis-mock');
-const { EgressWorker, buildFFmpegArgs } = require('./worker');
+const { EgressWorker, buildFFmpegArgs, waitForEgressReady } = require('./worker');
 
 test('buildFFmpegArgs handles local MP4 recording', () => {
   const roomSlug = 'test-room';
@@ -113,6 +113,50 @@ test('resolveOutputPath saves recordings to persistent RECORDINGS_DIR', () => {
   const outputPath = resolveOutputPath('demo-room', 'START_RECORDING');
   assert.ok(outputPath.startsWith('/app/recordings/'), 'Should save in RECORDINGS_DIR');
   assert.ok(outputPath.endsWith('.mp4'), 'Should end with .mp4');
+});
+
+test('waitForEgressReady resolves immediately when the page already signals ready', async () => {
+  const page = { evaluate: async () => true };
+  const start = Date.now();
+  const ready = await waitForEgressReady(page, { timeoutMs: 1000, pollIntervalMs: 200 });
+  assert.strictEqual(ready, true);
+  assert.ok(Date.now() - start < 100, 'should not wait a full poll interval when already ready');
+});
+
+test('waitForEgressReady polls until the flag flips true', async () => {
+  let calls = 0;
+  const page = {
+    evaluate: async () => {
+      calls += 1;
+      return calls >= 3; // ready on the 3rd poll
+    },
+  };
+  const ready = await waitForEgressReady(page, { timeoutMs: 1000, pollIntervalMs: 5 });
+  assert.strictEqual(ready, true);
+  assert.ok(calls >= 3, 'should have polled at least until the flag went true');
+});
+
+test('waitForEgressReady gives up and returns false after the timeout, never throwing', async () => {
+  const page = { evaluate: async () => false };
+  const ready = await waitForEgressReady(page, { timeoutMs: 30, pollIntervalMs: 10 });
+  assert.strictEqual(ready, false);
+});
+
+test('waitForEgressReady treats a page.evaluate rejection as not-ready rather than crashing', async () => {
+  const page = { evaluate: async () => { throw new Error('Execution context was destroyed'); } };
+  const ready = await waitForEgressReady(page, { timeoutMs: 30, pollIntervalMs: 10 });
+  assert.strictEqual(ready, false, 'a thrown evaluate should degrade to "not ready" by the deadline, not reject');
+});
+
+test('EgressWorker accepts egressReadyTimeoutMs/egressReadyPollMs for testability', () => {
+  const worker = new EgressWorker({
+    redisClient: new RedisMock(),
+    redisPubClient: new RedisMock(),
+    egressReadyTimeoutMs: 500,
+    egressReadyPollMs: 50,
+  });
+  assert.strictEqual(worker.egressReadyTimeoutMs, 500);
+  assert.strictEqual(worker.egressReadyPollMs, 50);
 });
 
 test('resolveOutputPath returns RTMP URL as-is for START_RTMP', () => {

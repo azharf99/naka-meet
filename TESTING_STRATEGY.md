@@ -87,3 +87,15 @@ Setelah *Unit Test* memiliki tingkat cakupan (*coverage*) minimal 85%, *Integrat
 2. Golang SFU melakukan inisialisasi.
 3. Mengirim *mock* JWT dan SDP Offer ke *endpoint* Signaling.
 4. Memvalidasi bahwa server SFU merespons dengan SDP Answer yang valid.
+
+* **Status:** Diimplementasikan di `apps/sfu/pkg/signaling/integration_test.go`
+  (build tag `integration`, dijalankan otomatis oleh job CI terpisah
+  `test-sfu-integration` — lihat `.github/workflows/ci-cd.yml`). Mencakup
+  alur E2E ringan di atas plus perluasannya ke dua *simulated peer* yang
+  saling bertukar track (host mempublikasikan sebuah track, guest yang
+  bergabung belakangan menerima offer renegosiasi + `track_metadata`-nya),
+  dengan setiap join diverifikasi benar-benar termirror ke Redis asli — satu
+  hal yang tidak bisa dicek *unit test* mana pun di paket ini karena semuanya
+  memakai `room.NewRoomManager(nil)`, yang melewati seluruh jalur kode Redis.
+  Egress *container* (langkah 3 dari daftar Tools di atas) belum termasuk
+  dalam scope ini — masih backlog untuk L4 (lihat catatan postmortem).

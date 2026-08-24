@@ -52,6 +52,13 @@ type APIHandler struct {
 	// participant wasn't found connected to that room.
 	participantRemover func(roomSlug, participantID, reason string) bool
 
+	// participantMuter, when set, actually force-mutes a participant
+	// (typically signaling.Handler.ForceMuteParticipant) — BR1. Same
+	// delegation reasoning as participantRemover: this package only owns
+	// RoomManager bookkeeping, not the live WebSocket connection needed to
+	// tell the target's own client to mute itself.
+	participantMuter func(roomSlug, participantID string) bool
+
 	authLimiters  map[string]*rate.Limiter
 	authLimiterMu sync.Mutex
 }
@@ -103,6 +110,13 @@ func (h *APIHandler) SetRecordingBroadcaster(fn func(roomSlug string, active boo
 // update RoomManager's bookkeeping.
 func (h *APIHandler) SetParticipantRemover(fn func(roomSlug, participantID, reason string) bool) {
 	h.participantRemover = fn
+}
+
+// SetParticipantMuter wires a callback (typically
+// signaling.Handler.ForceMuteParticipant) so the host-only "mute
+// participant" endpoint below can actually reach them — BR1.
+func (h *APIHandler) SetParticipantMuter(fn func(roomSlug, participantID string) bool) {
+	h.participantMuter = fn
 }
 
 // SetUserStoreForTesting overrides the user store (e.g. with an in-memory
@@ -249,6 +263,13 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// /api/v1/rooms/:slug/participants/:id/remove
 	if strings.HasPrefix(path, "/api/v1/rooms/") && strings.HasSuffix(path, "/remove") && strings.Contains(path, "/participants/") && r.Method == http.MethodPost {
 		h.handleRemoveParticipant(w, r)
+		return
+	}
+
+	// 7c. Mute Participant Endpoint (host-only, moderation, BR1):
+	// /api/v1/rooms/:slug/participants/:id/mute
+	if strings.HasPrefix(path, "/api/v1/rooms/") && strings.HasSuffix(path, "/mute") && strings.Contains(path, "/participants/") && r.Method == http.MethodPost {
+		h.handleMuteParticipant(w, r)
 		return
 	}
 
@@ -590,6 +611,49 @@ func (h *APIHandler) handleRemoveParticipant(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":         "participant_removed",
+		"room":           roomSlug,
+		"participant_id": participantID,
+	})
+}
+
+// handleMuteParticipant is BR1's host-only "mute another participant's
+// microphone." Unlike removal, there is deliberately no matching "unmute"
+// endpoint — forcing someone's mic back on without their consent isn't
+// something BR1 asks for; the target's own client is what actually
+// disables its local track, this just asks it to.
+func (h *APIHandler) handleMuteParticipant(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/rooms/")
+	trimmed = strings.TrimSuffix(trimmed, "/mute")
+	parts := strings.SplitN(trimmed, "/participants/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.Error(w, "Bad Request: expected /rooms/:slug/participants/:id/mute", http.StatusBadRequest)
+		return
+	}
+	roomSlug, participantID := parts[0], parts[1]
+
+	claims := h.extractAndValidateToken(r)
+	if !h.isRoomHost(claims, roomSlug) {
+		http.Error(w, "Forbidden: Host authority required for this room", http.StatusForbidden)
+		return
+	}
+
+	if participantID == claims.UserID {
+		http.Error(w, "Bad Request: use the mic toggle to mute yourself", http.StatusBadRequest)
+		return
+	}
+
+	muted := false
+	if h.participantMuter != nil {
+		muted = h.participantMuter(roomSlug, participantID)
+	}
+	if !muted {
+		http.Error(w, "Participant not found in this room", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":         "participant_muted",
 		"room":           roomSlug,
 		"participant_id": participantID,
 	})

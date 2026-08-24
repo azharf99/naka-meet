@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Mic, MicOff, Video, VideoOff, Monitor, MessageSquare, Radio, CircleDot, PhoneOff, X } from 'lucide-react';
 
 export function validateRtmpUrl(url: string): boolean {
@@ -11,6 +11,11 @@ interface ControlsProps {
   isRecording?: boolean;
   isLiveStreaming?: boolean;
   isScreenSharing?: boolean;
+  // BR1: increments each time the host force-mutes this client. A counter
+  // rather than a boolean so a second force-mute (after the user manually
+  // unmuted in between) still re-triggers the sync below — a boolean
+  // that's already `true` wouldn't change on a repeat event.
+  forceMuteSignal?: number;
   onToggleMic: () => void;
   onToggleCam: () => void;
   onScreenShare: () => void;
@@ -27,6 +32,7 @@ export const Controls: React.FC<ControlsProps> = ({
   isRecording = false,
   isLiveStreaming = false,
   isScreenSharing = false,
+  forceMuteSignal,
   onToggleMic,
   onToggleCam,
   onScreenShare,
@@ -42,6 +48,16 @@ export const Controls: React.FC<ControlsProps> = ({
   const [showRtmpModal, setShowRtmpModal] = useState(false);
   const [rtmpUrlInput, setRtmpUrlInput] = useState('');
   const [rtmpError, setRtmpError] = useState('');
+
+  // BR1: App.tsx already disabled the local track and relayed media_state
+  // by the time this fires — this just syncs the mic button's own icon
+  // state, which App.tsx has no other way to reach (it's local to this
+  // component). Skips the initial mount (forceMuteSignal starts at 0,
+  // matching App.tsx's initial state) so a fresh join never renders as
+  // already-muted.
+  useEffect(() => {
+    if (forceMuteSignal) setMicOn(false);
+  }, [forceMuteSignal]);
 
   const handleMic = () => {
     setMicOn(!micOn);

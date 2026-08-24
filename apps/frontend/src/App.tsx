@@ -49,6 +49,12 @@ export const App: React.FC = () => {
   // presenting — distinct from "someone is presenting but suspended,"
   // which VideoGrid derives locally from remoteTracks + this peer ID.
   const [activePresentation, setActivePresentation] = useState<{ peerId: string; peerName: string } | null>(null);
+  // BR1: host force-mute. A counter, not a boolean — Controls needs to
+  // react every time a new force-mute event arrives (e.g. muted, manually
+  // unmuted, muted again), and a boolean that's already `true` wouldn't
+  // re-trigger that sync on a second mute.
+  const [forceMuteSignal, setForceMuteSignal] = useState(0);
+  const [showMutedByHostNotice, setShowMutedByHostNotice] = useState(false);
 
   const [chatOpen, setChatOpen] = useState(false);
   const [messages, setMessages] = useState<Array<{ sender: string; text: string; time: string }>>([]);
@@ -143,6 +149,8 @@ export const App: React.FC = () => {
     setRemoteStaleState(new Map());
     setRemovedReason(null);
     setActivePresentation(null);
+    setForceMuteSignal(0);
+    setShowMutedByHostNotice(false);
     setInMeeting(false);
     window.history.pushState({}, '', window.location.pathname);
   };
@@ -224,6 +232,22 @@ export const App: React.FC = () => {
         // notice instead of the generic connection-lost banner.
         service.onRemoved = (reason) => {
           setRemovedReason(reason);
+        };
+
+        // BR1: the host force-muted this client. Only this client's own
+        // browser can actually disable its local track, so this is the
+        // only place that ever happens — reads via service.getLocalStream()
+        // rather than the outer localStream state, which may not be set
+        // yet in this closure if the force-mute somehow raced connection
+        // setup.
+        service.onForceMuted = () => {
+          service.getLocalStream()?.getAudioTracks().forEach((t) => {
+            t.enabled = false;
+          });
+          service.sendMediaState('mic', false);
+          setForceMuteSignal((c) => c + 1);
+          setShowMutedByHostNotice(true);
+          setTimeout(() => setShowMutedByHostNotice(false), 4000);
         };
 
         service.onPresentationStateChanged = ({ activePeerId, activePeerName }) => {
@@ -313,8 +337,8 @@ export const App: React.FC = () => {
   const handleStartRTMP = (url: string) => sendEgressCommand('START_RTMP', url);
   const handleStopEgress = () => sendEgressCommand('STOP_EGRESS');
 
-  // Host-only moderation action (BR1). The target actually disconnects via
-  // the signaling WebSocket server-side (see signaling.Handler.RemoveParticipant)
+  // Host-only moderation action. The target actually disconnects via the
+  // signaling WebSocket server-side (see signaling.Handler.RemoveParticipant)
   // — this call just authorizes and triggers it; the removed participant's
   // own client shows the takeover notice via WebRTCService.onRemoved once
   // their connection receives the "removed" message.
@@ -334,6 +358,29 @@ export const App: React.FC = () => {
       }
     } catch (err) {
       console.error('Failed to remove participant', err);
+    }
+  };
+
+  // Host-only moderation action (BR1: "membungkam mikrofon peserta lain").
+  // Like removal, the actual mute happens on the target's own client (see
+  // WebRTCService.onForceMuted) — this call just authorizes and triggers
+  // it via the signaling WebSocket (signaling.Handler.ForceMuteParticipant).
+  const handleMuteParticipant = async (rawPeerId: string) => {
+    if (!rawPeerId) return;
+    try {
+      const res = await fetch(
+        `/api/v1/rooms/${roomSlug}/participants/${encodeURIComponent(rawPeerId)}/mute`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          credentials: 'include',
+        }
+      );
+      if (!res.ok) {
+        console.error('Failed to mute participant', await res.text());
+      }
+    } catch (err) {
+      console.error('Failed to mute participant', err);
     }
   };
 
@@ -410,6 +457,7 @@ export const App: React.FC = () => {
           remoteMediaState={remoteMediaState}
           remoteStaleState={remoteStaleState}
           onRemoveParticipant={userRole === 'host' ? handleRemoveParticipant : undefined}
+          onMuteParticipant={userRole === 'host' ? handleMuteParticipant : undefined}
           localPeerId={localPeerId}
           activePresentation={activePresentation}
           onSetPresentation={userRole === 'host' ? handleSetPresentation : undefined}
@@ -453,6 +501,15 @@ export const App: React.FC = () => {
             <div className="px-4 py-2 bg-red-600/90 text-white text-xs font-semibold rounded-lg shadow-lg backdrop-blur-md flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
               This meeting is being {recordingConsent.kind === 'rtmp' ? 'live streamed' : 'recorded'}.
+            </div>
+          )}
+
+          {/* BR1: transient, not a takeover — the user can still see and
+              use the rest of the meeting, they just need to know why their
+              mic went silent. */}
+          {showMutedByHostNotice && (
+            <div className="px-4 py-2 bg-amber-500/90 text-slate-950 text-xs font-semibold rounded-lg shadow-lg backdrop-blur-md">
+              You were muted by the host.
             </div>
           )}
         </div>
@@ -513,6 +570,7 @@ export const App: React.FC = () => {
         isRecording={isRecording}
         isLiveStreaming={isLiveStreaming}
         isScreenSharing={isScreenSharing}
+        forceMuteSignal={forceMuteSignal}
         onToggleMic={() => {
           if (localStream) {
             localStream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));

@@ -61,6 +61,11 @@ export class WebRTCService {
   // the UI can show "You were removed" instead of a generic drop/reload
   // prompt. reason is "host_removed" or "stale_timeout".
   public onRemoved?: (reason: string) => void;
+  // Fired when the host force-mutes this client (BR1). There's no
+  // "force_unmute" — only this client's own action can turn its mic back
+  // on, so the handler just needs to disable the local track and relay the
+  // usual media_state update, same as if the user had muted themselves.
+  public onForceMuted?: () => void;
   // wasConnected distinguishes a mid-call drop (WS reached `open` at least
   // once) from a connection that was refused outright — most commonly the
   // signaling WS being 403'd at upgrade because this origin isn't in the
@@ -306,6 +311,11 @@ export class WebRTCService {
       if (msg.type === 'removed') {
         this.wasRemoved = true;
         if (this.onRemoved) this.onRemoved(msg.reason || 'host_removed');
+        return;
+      }
+
+      if (msg.type === 'force_mute') {
+        if (this.onForceMuted) this.onForceMuted();
         return;
       }
 

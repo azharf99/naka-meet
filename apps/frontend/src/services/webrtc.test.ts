@@ -254,6 +254,21 @@ describe('WebRTCService Audit & Unit Tests', () => {
     expect(disconnectedCalled).toBe(false);
   });
 
+  test('incoming force_mute message triggers onForceMuted (BR1: host mutes another participant)', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    let forceMutedCalled = false;
+    service.onForceMuted = () => {
+      forceMutedCalled = true;
+    };
+
+    const ws = (service as any).ws;
+    ws.onmessage({ data: JSON.stringify({ type: 'force_mute' }) });
+
+    expect(forceMutedCalled).toBe(true);
+  });
+
   test('incoming presentation_state triggers onPresentationStateChanged with raw peer id/name', async () => {
     const service = new WebRTCService('demo-room');
     await service.connectToken('mock-jwt-token');

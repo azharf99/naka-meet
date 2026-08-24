@@ -270,6 +270,38 @@ func (h *Handler) RemoveParticipant(roomSlug, participantID, reason string) bool
 	return true
 }
 
+// ForceMuteParticipant is BR1's "host can mute other participants'
+// microphones": there's no way for the SFU (or the host) to directly flip
+// another peer's local MediaStreamTrack.enabled — that hardware-adjacent
+// track only exists in the target's own browser — so this sends a
+// "force_mute" message to that one participant's connection and relies on
+// their own client to comply (disable its local audio track and broadcast
+// the usual media_state update, same as if they'd muted themselves). Mute
+// only, deliberately: forcing someone's mic back ON without their consent
+// would be a privacy issue BR1 doesn't ask for.
+//
+// Room-scoped the same way RemoveParticipant is, for the same reason: a
+// host must never be able to target a participant outside the room they
+// actually have authority over. Returns false if participantID isn't
+// currently connected to this room on this Handler.
+func (h *Handler) ForceMuteParticipant(roomSlug, participantID string) bool {
+	h.mu.RLock()
+	var conn *SafeConn
+	if roomConns, exists := h.conns[roomSlug]; exists {
+		conn = roomConns[participantID]
+	}
+	h.mu.RUnlock()
+	if conn == nil {
+		return false
+	}
+
+	msgBytes, _ := json.Marshal(map[string]interface{}{
+		"type": "force_mute",
+	})
+	_ = conn.WriteMessage(websocket.TextMessage, msgBytes)
+	return true
+}
+
 // broadcastPeerStale notifies every participant in a room that a
 // publisher's track has gone silent (stale: true) or has recovered
 // (stale: false), driven by the RTP-liveness watchdog started in OnTrack.

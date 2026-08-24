@@ -16,6 +16,10 @@ interface VideoGridProps {
   // Host-only "remove participant" action. Present only for the host role;
   // undefined elsewhere so VideoTile never renders the control at all.
   onRemoveParticipant?: (rawPeerId: string) => void;
+  // Host-only "mute participant" action (BR1). Only ever offered on a
+  // camera tile — a participant's mic lives on their camera+mic stream,
+  // not their screen share, so this never applies to a screen tile.
+  onMuteParticipant?: (rawPeerId: string) => void;
   // This client's own raw participant ID — needed to tell whether
   // activePresentation (below) is this client's own screen share or
   // someone else's, since ParticipantTrack never carries an entry for the
@@ -123,6 +127,29 @@ export function resolvePresentationView(
   return { activeIsLocal, activeRemoteTrack, suspendedRemoteScreens, localSuspended, stageModeActive, presentationLabel };
 }
 
+// getSidebarLayoutClasses picks how Stage Mode's participant sidebar
+// behaves once there are more tiles than fit comfortably. The egress
+// recorder's viewport can never scroll — FFmpeg's x11grab only ever
+// captures whatever's currently visible on screen, so anything that
+// overflowed would simply be missing from the recording — so it keeps the
+// older shrink-every-tile-to-fit-no-scroll behavior: better for everyone
+// to be present but small than for someone to silently vanish from the
+// recording. A real user-facing UI has no such constraint, so it scrolls
+// instead once tiles would otherwise be squeezed past a legible minimum
+// height — squeezing to illegibility defeats the point of showing
+// everyone at all.
+//
+// Pulled out as its own function (rather than an inline ternary in the
+// component) specifically so a regression here — accidentally flipping
+// which branch egress gets — has a direct unit test, the same lesson as
+// the ALLOWED_ORIGINS bug: a small, easy-to-get-backwards condition that
+// only ever bites the recording path, which nothing else here exercises.
+export function getSidebarLayoutClasses(isEgress: boolean): { container: string; tile: string } {
+  return isEgress
+    ? { container: 'flex flex-col gap-3 h-full min-h-0 overflow-hidden', tile: 'flex-1 min-h-0' }
+    : { container: 'flex flex-col gap-3 h-full min-h-0 overflow-y-auto pr-1', tile: 'flex-1 min-h-[140px]' };
+}
+
 export function deriveVisibility(
   isMicMuted: boolean | undefined,
   isCamOff: boolean | undefined,
@@ -158,6 +185,10 @@ const VideoTile: React.FC<{
   // control never renders for guests or for tiles metadata hasn't caught
   // up with yet.
   onRemove?: () => void;
+  // Host-only "mute this participant" action (BR1) — same undefined-when-
+  // not-applicable contract as onRemove. Never offered on a screen-share
+  // tile (see onMuteParticipant's own comment on VideoGridProps).
+  onMute?: () => void;
   // True for a screen share that's currently live but not the room's
   // active presentation (BR: the latest share wins by default; others are
   // suspended, not dropped, so the host can still choose to show them).
@@ -167,7 +198,7 @@ const VideoTile: React.FC<{
   // (including for the presenter reclaiming their own suspended share:
   // that's a host-only action too, per BR).
   onPromote?: () => void;
-}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove, isSuspended, onPromote }) => {
+}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove, onMute, isSuspended, onPromote }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
@@ -253,14 +284,27 @@ const VideoTile: React.FC<{
         </div>
       )}
 
-      {onRemove && (
-        <button
-          onClick={onRemove}
-          title={`Remove ${label} from the meeting`}
-          className="absolute top-3 left-3 z-20 p-1.5 bg-slate-950/80 hover:bg-red-600 text-slate-300 hover:text-white rounded-lg backdrop-blur-md border border-slate-800 hover:border-red-500/50 opacity-0 group-hover:opacity-100 transition-opacity shadow-md"
-        >
-          <UserX className="w-3.5 h-3.5" />
-        </button>
+      {(onRemove || onMute) && (
+        <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+          {onMute && (
+            <button
+              onClick={onMute}
+              title={`Mute ${label}'s microphone`}
+              className="p-1.5 bg-slate-950/80 hover:bg-amber-600 text-slate-300 hover:text-white rounded-lg backdrop-blur-md border border-slate-800 hover:border-amber-500/50 shadow-md"
+            >
+              <MicOff className="w-3.5 h-3.5" />
+            </button>
+          )}
+          {onRemove && (
+            <button
+              onClick={onRemove}
+              title={`Remove ${label} from the meeting`}
+              className="p-1.5 bg-slate-950/80 hover:bg-red-600 text-slate-300 hover:text-white rounded-lg backdrop-blur-md border border-slate-800 hover:border-red-500/50 shadow-md"
+            >
+              <UserX className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
       )}
 
       {showVideoFallback && (
@@ -306,6 +350,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   remoteMediaState,
   remoteStaleState,
   onRemoveParticipant,
+  onMuteParticipant,
   localPeerId,
   activePresentation,
   onSetPresentation,
@@ -339,18 +384,25 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   const removeHandlerFor = (track: ParticipantTrack): (() => void) | undefined =>
     isHost && track.rawPeerId ? () => onRemoveParticipant?.(track.rawPeerId) : undefined;
 
+  // BR1: host-only "mute this participant's mic" — only ever attached to a
+  // camera tile (see onMuteParticipant's comment on VideoGridProps), never
+  // a screen-share one. Same undefined-when-not-applicable contract.
+  const muteHandlerFor = (track: ParticipantTrack): (() => void) | undefined =>
+    isHost && track.rawPeerId ? () => onMuteParticipant?.(track.rawPeerId) : undefined;
+
   // Host-only "show to everyone" for a suspended share — matches
   // removeHandlerFor's undefined-when-not-applicable contract.
   const promoteHandlerFor = (peerId: string): (() => void) | undefined =>
     isHost && peerId ? () => onSetPresentation?.(peerId) : undefined;
 
   // BR4/arbitration: Stage Mode rendering when a screen share (active or
-  // suspended) exists anywhere in the room. Tiles fill their allotted
-  // space instead of scrolling: a fixed egress viewport (Puppeteer
-  // recording this page) can never scroll, so anything that overflowed
-  // here would simply be missing from the recording.
+  // suspended) exists anywhere in the room. The main presentation tile
+  // always fills its allotted space (never scrolls) — it's one tile, not a
+  // list. The sidebar's scroll-vs-shrink behavior is egress-aware; see
+  // getSidebarLayoutClasses.
   if (stageModeActive) {
     const sidebarCameraTracks = uniqueTracks.filter((t) => !t.isScreenShare);
+    const sidebarLayout = getSidebarLayoutClasses(isEgress);
 
     return (
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 h-[calc(100vh-80px)] overflow-hidden">
@@ -363,15 +415,15 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
             onRemove={activeRemoteTrack ? removeHandlerFor(activeRemoteTrack) : undefined}
           />
         </div>
-        <div className="flex flex-col gap-3 h-full min-h-0 overflow-hidden">
+        <div className={sidebarLayout.container}>
           {!isEgress && (
-            <div className="flex-1 min-h-0">
+            <div className={sidebarLayout.tile}>
               <VideoTile stream={localStream} label={localLabel} />
             </div>
           )}
 
           {localSuspended && (
-            <div className="flex-1 min-h-0">
+            <div className={sidebarLayout.tile}>
               <VideoTile
                 stream={localScreenStream}
                 label="Your Screen"
@@ -383,7 +435,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
           )}
 
           {suspendedRemoteScreens.map((track) => (
-            <div key={track.id} className="flex-1 min-h-0">
+            <div key={track.id} className={sidebarLayout.tile}>
               <VideoTile
                 stream={track.stream}
                 label={`${track.peerID.slice(0, 12)}'s Screen`}
@@ -400,7 +452,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
             // heuristic instead of forcing "not muted"/"camera on".
             const state = remoteMediaState?.get(track.peerID);
             return (
-              <div key={track.id} className="flex-1 min-h-0">
+              <div key={track.id} className={sidebarLayout.tile}>
                 <VideoTile
                   stream={track.stream}
                   label={`User ${track.peerID.slice(0, 6)}`}
@@ -408,6 +460,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
                   isCamOff={state ? state.cam === false : undefined}
                   isStale={remoteStaleState?.get(track.peerID)}
                   onRemove={removeHandlerFor(track)}
+                  onMute={muteHandlerFor(track)}
                 />
               </div>
             );
@@ -435,6 +488,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
               isCamOff={state ? state.cam === false : undefined}
               isStale={remoteStaleState?.get(track.peerID)}
               onRemove={removeHandlerFor(track)}
+              onMute={muteHandlerFor(track)}
             />
           );
         })}

@@ -12,9 +12,9 @@ describe('VideoGrid Helper Tests', () => {
 
   test('deduplicateTracks consolidates audio & video tracks from same stream/peer into 1 item', () => {
     const tracks = [
-      { id: 'v1', peerID: 'peer-1', stream: { id: 'stream-1' } as any, isScreenShare: false },
-      { id: 'a1', peerID: 'peer-1', stream: { id: 'stream-1' } as any, isScreenShare: false },
-      { id: 'v2', peerID: 'peer-2', stream: { id: 'stream-2' } as any, isScreenShare: false },
+      { id: 'v1', peerID: 'peer-1', rawPeerId: 'uuid-1', stream: { id: 'stream-1' } as any, isScreenShare: false },
+      { id: 'a1', peerID: 'peer-1', rawPeerId: 'uuid-1', stream: { id: 'stream-1' } as any, isScreenShare: false },
+      { id: 'v2', peerID: 'peer-2', rawPeerId: 'uuid-2', stream: { id: 'stream-2' } as any, isScreenShare: false },
     ];
     const deduplicated = deduplicateTracks(tracks);
     expect(deduplicated.length).toBe(2);
@@ -24,8 +24,8 @@ describe('VideoGrid Helper Tests', () => {
 
   test('deduplicateTracks preserves isScreenShare flag for BR4 Stage Mode', () => {
     const tracks = [
-      { id: 'v1', peerID: 'peer-1', stream: { id: 'stream-1' } as any, isScreenShare: false },
-      { id: 's1', peerID: 'peer-1', stream: { id: 'stream-screen' } as any, isScreenShare: true },
+      { id: 'v1', peerID: 'peer-1', rawPeerId: 'uuid-1', stream: { id: 'stream-1' } as any, isScreenShare: false },
+      { id: 's1', peerID: 'peer-1', rawPeerId: 'uuid-1', stream: { id: 'stream-screen' } as any, isScreenShare: true },
     ];
     const deduplicated = deduplicateTracks(tracks);
     const screenTrack = deduplicated.find((t) => t.isScreenShare);

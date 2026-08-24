@@ -415,6 +415,151 @@ func TestAPI_EgressTriggerHandler_BroadcastsRecordingConsentState(t *testing.T) 
 	assert.Equal(t, "recording", gotKind)
 }
 
+func TestAPI_RemoveParticipantHandler_HostCanRemove(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	var gotSlug, gotParticipantID, gotReason string
+	handler.SetParticipantRemover(func(slug, participantID, reason string) bool {
+		gotSlug, gotParticipantID, gotReason = slug, participantID, reason
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	guestID, _ := uuid.NewV7()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+guestID.String()+"/remove", nil)
+	req.Header.Set("Authorization", "Bearer "+hostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "demo-room", gotSlug)
+	assert.Equal(t, guestID.String(), gotParticipantID)
+	assert.Equal(t, "host_removed", gotReason)
+}
+
+func TestAPI_RemoveParticipantHandler_NonOwnerHostForbidden(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	removerCalled := false
+	handler.SetParticipantRemover(func(string, string, string) bool {
+		removerCalled = true
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	otherHostID, _ := uuid.NewV7()
+	otherHostToken, _ := auth.GenerateTokenWithName(otherHostID.String(), "Other Host", "host", secret, time.Hour)
+
+	guestID, _ := uuid.NewV7()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+guestID.String()+"/remove", nil)
+	req.Header.Set("Authorization", "Bearer "+otherHostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.False(t, removerCalled, "an unrelated host's JWT must never reach the actual removal callback")
+}
+
+func TestAPI_RemoveParticipantHandler_GuestForbidden(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	removerCalled := false
+	handler.SetParticipantRemover(func(string, string, string) bool {
+		removerCalled = true
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	guestID, _ := uuid.NewV7()
+	guestToken, _ := auth.GenerateTokenWithName(guestID.String(), "Guest", "guest", secret, time.Hour)
+	otherID, _ := uuid.NewV7()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+otherID.String()+"/remove", nil)
+	req.Header.Set("Authorization", "Bearer "+guestToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.False(t, removerCalled)
+}
+
+func TestAPI_RemoveParticipantHandler_CannotTargetSelf(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	removerCalled := false
+	handler.SetParticipantRemover(func(string, string, string) bool {
+		removerCalled = true
+		return true
+	})
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+hostID.String()+"/remove", nil)
+	req.Header.Set("Authorization", "Bearer "+hostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.False(t, removerCalled, "a host targeting their own ID should be rejected before reaching the removal callback")
+}
+
+func TestAPI_RemoveParticipantHandler_UnknownParticipantReturns404(t *testing.T) {
+	secret := []byte("api-secret-key")
+	mockPub := &MockPublisher{}
+	rm := room.NewRoomManager(nil)
+	handler := api.NewAPIHandlerWithDeps(secret, mockPub, rm, nil)
+
+	// Simulates the participant already having disconnected on their own,
+	// or an ID that was never valid to begin with.
+	handler.SetParticipantRemover(func(string, string, string) bool { return false })
+
+	hostID, _ := uuid.NewV7()
+	hostToken, _ := auth.GenerateTokenWithName(hostID.String(), "Host User", "host", secret, time.Hour)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/rooms", strings.NewReader(`{"slug":"demo-room"}`))
+	createReq.Header.Set("Authorization", "Bearer "+hostToken)
+	handler.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	guestID, _ := uuid.NewV7()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rooms/demo-room/participants/"+guestID.String()+"/remove", nil)
+	req.Header.Set("Authorization", "Bearer "+hostToken)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
 func TestAPI_CreateRoomHandler_HostAllowed(t *testing.T) {
 	secret := []byte("api-secret-key")
 	handler := api.NewAPIHandler(secret, nil)

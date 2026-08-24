@@ -4,7 +4,7 @@ import { guestJoin, getSession, logout } from './services/auth';
 import { VideoGrid } from './components/VideoGrid';
 import { Controls } from './components/Controls';
 import { Lobby, HostSession } from './components/Lobby';
-import { Send, X, ShieldCheck, UserCheck, LogOut } from 'lucide-react';
+import { Send, X, ShieldCheck, UserCheck, LogOut, UserX } from 'lucide-react';
 
 export const App: React.FC = () => {
   const urlParams = new URLSearchParams(window.location.search);
@@ -21,8 +21,16 @@ export const App: React.FC = () => {
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const [remoteTracks, setRemoteTracks] = useState<ParticipantTrack[]>([]);
   const [remoteMediaState, setRemoteMediaState] = useState<Map<string, { mic: boolean; cam: boolean }>>(new Map());
+  // Keyed the same way as remoteMediaState (by peerID/display name) — true
+  // while the server's RTP-liveness watchdog has flagged that publisher's
+  // track as silent (frozen video that isn't recovering on its own).
+  const [remoteStaleState, setRemoteStaleState] = useState<Map<string, boolean>>(new Map());
   const [connectionLost, setConnectionLost] = useState(false);
   const [connectionRejected, setConnectionRejected] = useState(false);
+  // Set when THIS client is force-removed (by the host, or by the
+  // stale-timeout auto-removal) — a takeover notice rather than a small
+  // banner, since unlike a network drop there's nothing to reload/retry.
+  const [removedReason, setRemovedReason] = useState<string | null>(null);
   const [recordingConsent, setRecordingConsent] = useState<{ active: boolean; kind: string } | null>(null);
 
   const [chatOpen, setChatOpen] = useState(false);
@@ -113,6 +121,8 @@ export const App: React.FC = () => {
     setMessages([]);
     setConnectionLost(false);
     setConnectionRejected(false);
+    setRemoteStaleState(new Map());
+    setRemovedReason(null);
     setInMeeting(false);
     window.history.pushState({}, '', window.location.pathname);
   };
@@ -175,6 +185,25 @@ export const App: React.FC = () => {
           // via a LAN IP or 127.0.0.1 that isn't listed), not a mid-call
           // network drop. Worth a distinct message: "reload" doesn't fix it.
           setConnectionRejected(!wasConnected);
+        };
+
+        service.onPeerStaleChanged = ({ peerId, stale }) => {
+          setRemoteStaleState((prev) => {
+            const next = new Map(prev);
+            if (stale) {
+              next.set(peerId, true);
+            } else {
+              next.delete(peerId);
+            }
+            return next;
+          });
+        };
+
+        // Distinct from onDisconnected: this client was force-removed, not
+        // dropped — nothing to reload/retry, so it gets its own takeover
+        // notice instead of the generic connection-lost banner.
+        service.onRemoved = (reason) => {
+          setRemovedReason(reason);
         };
 
         // Server-triggered broadcast (from the host's REST call, not this
@@ -240,6 +269,30 @@ export const App: React.FC = () => {
   const handleStartRecording = () => sendEgressCommand('START_RECORDING');
   const handleStartRTMP = (url: string) => sendEgressCommand('START_RTMP', url);
   const handleStopEgress = () => sendEgressCommand('STOP_EGRESS');
+
+  // Host-only moderation action (BR1). The target actually disconnects via
+  // the signaling WebSocket server-side (see signaling.Handler.RemoveParticipant)
+  // — this call just authorizes and triggers it; the removed participant's
+  // own client shows the takeover notice via WebRTCService.onRemoved once
+  // their connection receives the "removed" message.
+  const handleRemoveParticipant = async (rawPeerId: string) => {
+    if (!rawPeerId) return;
+    try {
+      const res = await fetch(
+        `/api/v1/rooms/${roomSlug}/participants/${encodeURIComponent(rawPeerId)}/remove`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          credentials: 'include',
+        }
+      );
+      if (!res.ok) {
+        console.error('Failed to remove participant', await res.text());
+      }
+    } catch (err) {
+      console.error('Failed to remove participant', err);
+    }
+  };
 
 
   if (!inMeeting) {
@@ -308,7 +361,34 @@ export const App: React.FC = () => {
           displayName={displayName}
           userRole={userRole}
           remoteMediaState={remoteMediaState}
+          remoteStaleState={remoteStaleState}
+          onRemoveParticipant={userRole === 'host' ? handleRemoveParticipant : undefined}
         />
+
+        {/* Removal takeover notice: unlike a dropped connection, there's
+            nothing to reload/retry here, so this replaces the meeting view
+            entirely instead of sitting alongside it as a small banner. */}
+        {removedReason && (
+          <div className="absolute inset-0 z-[60] bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 max-w-sm w-full text-center shadow-2xl">
+              <div className="w-14 h-14 mx-auto mb-4 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400">
+                <UserX className="w-7 h-7" />
+              </div>
+              <h3 className="font-semibold text-slate-100 text-base mb-2">You were removed from this meeting</h3>
+              <p className="text-xs text-slate-400 mb-6">
+                {removedReason === 'stale_timeout'
+                  ? 'Your video appeared to freeze and did not recover in time, so you were disconnected.'
+                  : 'The host removed you from this room.'}
+              </p>
+              <button
+                onClick={handleLeaveRoom}
+                className="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-xl shadow-lg shadow-indigo-600/30"
+              >
+                Return to Lobby
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2">
           {connectionLost && (

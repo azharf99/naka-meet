@@ -603,6 +603,115 @@ func TestSignaling_ParticipantLeftBroadcastOnDisconnect(t *testing.T) {
 	assert.Equal(t, userB.String(), msgA.PeerID)
 }
 
+// TestSignaling_RemoveParticipant_SendsRemovedMessageAndDisconnects covers
+// the host-triggered "kick" path: the removed participant should get a
+// distinct "removed" message (not just a raw connection drop it has to
+// guess the reason for), everyone else in the room should see the usual
+// participant_left tile-cleanup, and the removal should be immediate — not
+// deferred behind the normal 15s reconnect-grace window.
+func TestSignaling_RemoveParticipant_SendsRemovedMessageAndDisconnects(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	userA, _ := uuid.NewV7()
+	tokenA, _ := auth.GenerateTokenWithName(userA.String(), "Host", "host", secret, 1*time.Hour)
+	wsURLA := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=remove-room&token=" + tokenA
+	wsA, _, err := websocket.DefaultDialer.Dial(wsURLA, nil)
+	require.NoError(t, err)
+	defer wsA.Close()
+
+	userB, _ := uuid.NewV7()
+	tokenB, _ := auth.GenerateTokenWithName(userB.String(), "Guest", "participant", secret, 1*time.Hour)
+	wsURLB := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=remove-room&token=" + tokenB
+	wsB, _, err := websocket.DefaultDialer.Dial(wsURLB, nil)
+	require.NoError(t, err)
+	defer wsB.Close()
+
+	// The client's Dial() returns as soon as the HTTP upgrade completes,
+	// which races the server's own post-upgrade setup (AddParticipant,
+	// AddPeer, then registerConn — see ServeHTTP) — registerConn in
+	// particular is what RemoveParticipant depends on, so poll rather than
+	// assume it's already done by the time Dial() returns.
+	var removed bool
+	require.Eventually(t, func() bool {
+		removed = handler.RemoveParticipant("remove-room", userB.String(), "host_removed")
+		return removed
+	}, 2*time.Second, 10*time.Millisecond, "RemoveParticipant should eventually succeed once User B's connection finishes registering")
+
+	var removedMsg struct {
+		Type   string `json:"type"`
+		Reason string `json:"reason"`
+	}
+	require.NoError(t, wsB.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, wsB.ReadJSON(&removedMsg))
+	assert.Equal(t, "removed", removedMsg.Type)
+	assert.Equal(t, "host_removed", removedMsg.Reason)
+
+	var leftMsg struct {
+		Type   string `json:"type"`
+		PeerID string `json:"peer_id"`
+	}
+	require.NoError(t, wsA.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, wsA.ReadJSON(&leftMsg))
+	assert.Equal(t, "participant_left", leftMsg.Type)
+	assert.Equal(t, userB.String(), leftMsg.PeerID)
+
+	// Immediate, not deferred behind the 15s reconnect grace: RemoveParticipant
+	// removes the participant from the RoomManager itself before closing the
+	// connection, so the count reflects the kick right away.
+	assert.Equal(t, 1, rm.GetParticipantCount("remove-room"), "removed participant should no longer count toward the room")
+}
+
+// TestSignaling_RemoveParticipant_ScopedToRoom guards against a host
+// targeting a participant ID that belongs to a different room than the one
+// they have authority over — the API layer checks host-of-this-room, but
+// RemoveParticipant itself must independently refuse to act cross-room in
+// case that check is ever bypassed or misused.
+func TestSignaling_RemoveParticipant_ScopedToRoom(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	userB, _ := uuid.NewV7()
+	tokenB, _ := auth.GenerateTokenWithName(userB.String(), "Guest", "participant", secret, 1*time.Hour)
+	wsURLB := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=real-room&token=" + tokenB
+	wsB, _, err := websocket.DefaultDialer.Dial(wsURLB, nil)
+	require.NoError(t, err)
+	defer wsB.Close()
+
+	removed := handler.RemoveParticipant("some-other-room", userB.String(), "host_removed")
+	assert.False(t, removed, "RemoveParticipant must not act on a participant who isn't in the specified room")
+	// AddParticipant for "real-room" races Dial() returning, same as the
+	// registerConn race noted in the test above — poll rather than assume.
+	require.Eventually(t, func() bool {
+		return rm.GetParticipantCount("real-room") == 1
+	}, 2*time.Second, 10*time.Millisecond, "participant should remain untouched in their actual room")
+}
+
+// TestSignaling_RemoveParticipant_ReturnsFalseWhenNotConnected covers the
+// REST endpoint calling this for a stale/already-disconnected participant
+// ID — it should report failure (surfaced as 404 by the API layer) rather
+// than panicking or silently succeeding.
+func TestSignaling_RemoveParticipant_ReturnsFalseWhenNotConnected(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+
+	unknownID, _ := uuid.NewV7()
+	removed := handler.RemoveParticipant("empty-room", unknownID.String(), "host_removed")
+	assert.False(t, removed)
+}
+
 // TestSignaling_EgressRoleParticipantExemptFromRoomCap reproduces the egress
 // recorder occupying a real slot against the human-facing 50-participant
 // cap: every recording session permanently reduced real headroom in the

@@ -1,6 +1,13 @@
 export interface ParticipantTrack {
   id: string;
   peerID: string;
+  // The raw UUID peer_id from track_metadata — distinct from peerID above,
+  // which is actually the resolved display name (see the comment on
+  // `peerID: peerName` in the ontrack handler below). Needed for
+  // participant-targeting host actions like removal, where the REST
+  // endpoint expects the real ID, not a display name that could collide or
+  // change. Empty if metadata hasn't arrived yet for this track.
+  rawPeerId: string;
   stream: MediaStream;
   isScreenShare: boolean;
 }
@@ -9,6 +16,7 @@ export type TrackCallback = (track: ParticipantTrack) => void;
 export type MessageCallback = (msg: { sender: string; text: string; time: string }) => void;
 export type MediaStateCallback = (state: { peerId: string; kind: 'mic' | 'cam'; enabled: boolean }) => void;
 export type RecordingStateCallback = (state: { active: boolean; kind: string }) => void;
+export type PeerStaleCallback = (state: { peerId: string; kind: string; stale: boolean }) => void;
 
 export class WebRTCService {
   private pc: RTCPeerConnection | null = null;
@@ -38,6 +46,16 @@ export class WebRTCService {
   public onMessageReceived?: MessageCallback;
   public onMediaStateChanged?: MediaStateCallback;
   public onRecordingStateChanged?: RecordingStateCallback;
+  // Fired when the server's RTP-liveness watchdog flags a publisher's track
+  // as having gone silent (stale: true) or having recovered (stale: false)
+  // — lets the grid show a "reconnecting" state instead of a permanently
+  // frozen last frame with no explanation.
+  public onPeerStaleChanged?: PeerStaleCallback;
+  // Fired when THIS client is force-removed by the host (or by the
+  // server's stale-timeout auto-removal) — distinct from onDisconnected so
+  // the UI can show "You were removed" instead of a generic drop/reload
+  // prompt. reason is "host_removed" or "stale_timeout".
+  public onRemoved?: (reason: string) => void;
   // wasConnected distinguishes a mid-call drop (WS reached `open` at least
   // once) from a connection that was refused outright — most commonly the
   // signaling WS being 403'd at upgrade because this origin isn't in the
@@ -45,6 +63,10 @@ export class WebRTCService {
   // (onclose fires either way) but call for very different user-facing
   // messages, so the distinction has to be tracked here.
   public onDisconnected?: (wasConnected: boolean) => void;
+  // Set once a "removed" message arrives, so the subsequent onclose (the
+  // server closes the connection right after sending it) doesn't also fire
+  // the generic onDisconnected — the removal notice already explains why.
+  private wasRemoved = false;
 
   constructor(private roomSlug: string) {}
 
@@ -162,6 +184,7 @@ export class WebRTCService {
         this.onTrackAdded({
           id: trackId,
           peerID: peerName,
+          rawPeerId: metadata?.peerId || '',
           stream: stream,
           isScreenShare: isScreen,
         });
@@ -196,6 +219,10 @@ export class WebRTCService {
     };
 
     this.ws.onclose = () => {
+      // The server sends "removed" then closes the socket itself — that
+      // close shouldn't also trigger the generic "Connection lost" banner,
+      // which would misleadingly suggest reloading might fix it.
+      if (this.wasRemoved) return;
       if (this.onDisconnected) this.onDisconnected(wsDidOpen);
     };
     this.ws.onerror = (err) => {
@@ -243,6 +270,22 @@ export class WebRTCService {
             enabled: !!msg.enabled,
           });
         }
+        return;
+      }
+
+      if (msg.type === 'peer_stale') {
+        // Same peer_name-over-peer_id convention as media_state above, so
+        // this keys into the same map VideoGrid looks up by track.peerID.
+        const peerId = msg.peer_name || msg.peer_id;
+        if (peerId && this.onPeerStaleChanged) {
+          this.onPeerStaleChanged({ peerId, kind: msg.kind || '', stale: !!msg.stale });
+        }
+        return;
+      }
+
+      if (msg.type === 'removed') {
+        this.wasRemoved = true;
+        if (this.onRemoved) this.onRemoved(msg.reason || 'host_removed');
         return;
       }
 

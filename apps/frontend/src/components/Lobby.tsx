@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, Video, ArrowRight, AlertCircle, UserPlus, LogOut } from 'lucide-react';
+import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, ArrowRight, AlertCircle, UserPlus, LogOut } from 'lucide-react';
 import { login, signup, createRoom, logout, SessionResponse } from '../services/auth';
 
 export function validateJoinInput(name: string, roomSlug: string): { valid: boolean; error?: string } {

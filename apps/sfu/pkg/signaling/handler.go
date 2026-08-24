@@ -115,6 +115,12 @@ func (h *Handler) isAllowedOrigin(r *http.Request) bool {
 			return true
 		}
 	}
+	// Logged at warn, not silently dropped: a mismatched ALLOWED_ORIGINS
+	// entry (a participant reached via LAN IP/127.0.0.1 while only
+	// http://localhost:3000 is allowlisted, for example) otherwise produces
+	// zero server-side signal — the WS upgrade just 403s and the room never
+	// sees that participant, with no log line pointing at why.
+	log.Printf("signaling: rejected WS upgrade from disallowed origin %q (allowed: %v)", origin, h.allowedOrigins)
 	return false
 }
 

@@ -7,12 +7,92 @@ on:
     branches: [ "main" ]
 
 jobs:
+  # Every one of these three used to be optional: PROJECT_STATE.md records
+  # them passing locally, but nothing re-ran them before an image reached
+  # :latest. build-and-deploy below now depends on all three, so a failing
+  # test blocks the push instead of shipping silently.
+  test-sfu:
+    name: Test — Go SFU Backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/sfu/go.mod
+
+      - name: go vet
+        working-directory: apps/sfu
+        run: go vet ./...
+
+      # -race is mandatory here (see TESTING_STRATEGY.md): the SFU router
+      # and room manager share maps across goroutines by design, and a data
+      # race is exactly the class of bug this project has hit repeatedly.
+      - name: go test -race
+        working-directory: apps/sfu
+        run: go test -v -race ./...
+
+  test-frontend:
+    name: Test — Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: apps/frontend
+        run: npm run lint
+
+      - name: Typecheck + build
+        working-directory: apps/frontend
+        run: npm run build
+
+      - name: Unit tests (Vitest)
+        working-directory: apps/frontend
+        run: npm test
+
+  test-egress:
+    name: Test — Egress Worker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/egress/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/egress
+        run: npm ci
+
+      - name: Unit tests
+        working-directory: apps/egress
+        run: npm test
+
   build-and-deploy:
     name: Build Image and Deploy to VPS
     runs-on: ubuntu-latest
+    needs: [test-sfu, test-frontend, test-egress]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    if: github.ref == 'refs/heads/main' # Hanya jalankan saat push ke main
+    if: github.ref == 'refs/heads/main' # Hanya jalankan saat push ke main, setelah semua test lulus
 
     steps:
     - name: Checkout Code

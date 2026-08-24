@@ -88,6 +88,37 @@ func TestSignaling_HTTPUpgradeUnauthorized(t *testing.T) {
 	}
 }
 
+// TestSignaling_HTTPUpgradeRejectsDisallowedOrigin guards the ALLOWED_ORIGINS
+// allowlist: a well-formed, authenticated request from an origin outside the
+// configured allowlist (e.g. a participant reaching the app via LAN IP or
+// 127.0.0.1 while only http://localhost:3000 is allowlisted) must still be
+// rejected at the WS-upgrade step, not silently admitted.
+func TestSignaling_HTTPUpgradeRejectsDisallowedOrigin(t *testing.T) {
+	secret := []byte("secret-key")
+	rm := room.NewRoomManager(nil)
+	router, _ := webrtc.NewSFURouter(50000, 50050)
+	handler := signaling.NewHandler(rm, router, secret)
+	handler.SetAllowedOrigins([]string{"http://localhost:3000"})
+
+	userID, _ := uuid.NewV7()
+	token, err := auth.GenerateToken(userID.String(), "host", secret, 1*time.Hour)
+	require.NoError(t, err)
+
+	server := httptest.NewServer(http.HandlerFunc(handler.ServeHTTP))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=room-1&token=" + token
+
+	header := http.Header{}
+	header.Add("Origin", "http://192.168.18.3:3000")
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	assert.Error(t, err)
+	if resp != nil {
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	}
+}
+
 func TestSignaling_HTTPUpgradeAuthorizedViaCookie(t *testing.T) {
 	secret := []byte("secret-key")
 	rm := room.NewRoomManager(nil)

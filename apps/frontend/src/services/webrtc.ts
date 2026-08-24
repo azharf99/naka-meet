@@ -1,3 +1,13 @@
+import { getIceServers } from './auth';
+
+// Used only if fetching this deployment's own ICE server list fails
+// outright (network error) — not the steady-state behavior. The backend's
+// /api/v1/ice-servers already returns this same entry when TURN isn't
+// configured, so this is purely a fallback for "couldn't even reach the
+// backend", keeping a connection attempt possible rather than failing
+// immediately.
+const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+
 export interface ParticipantTrack {
   id: string;
   peerID: string;
@@ -82,20 +92,31 @@ export class WebRTCService {
 
 
   public async connectToken(token: string): Promise<void> {
-    // 1. Get Local Media (Camera + Mic)
-    try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720 },
-        audio: true,
-      });
-    } catch (err) {
-      console.warn('Could not access media devices, proceeding audio/video muted', err);
-    }
+    // 1. Get Local Media (Camera + Mic) and this deployment's ICE server
+    // list (STUN, plus TURN if the operator has configured coturn — see
+    // .env.example) in parallel — independent I/O with nothing to
+    // serialize. STUN alone silently strands any participant whose network
+    // needs a relay (symmetric NAT, most mobile carriers, restrictive
+    // corporate firewalls) — invisible on a single LAN, which is exactly
+    // why that class of failure is easy to ship without noticing.
+    const [mediaResult, iceServers] = await Promise.all([
+      navigator.mediaDevices
+        .getUserMedia({ video: { width: 1280, height: 720 }, audio: true })
+        .catch((err) => {
+          console.warn('Could not access media devices, proceeding audio/video muted', err);
+          return null;
+        }),
+      getIceServers(token)
+        .then((res) => (res.iceServers.length > 0 ? res.iceServers : FALLBACK_ICE_SERVERS))
+        .catch((err) => {
+          console.warn('Could not fetch ICE server config, falling back to public STUN only', err);
+          return FALLBACK_ICE_SERVERS;
+        }),
+    ]);
+    this.localStream = mediaResult;
 
     // 2. Setup RTCPeerConnection
-    this.pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-    });
+    this.pc = new RTCPeerConnection({ iceServers });
 
     // Handle Trickle ICE Candidates
     this.pc.onicecandidate = (event) => {

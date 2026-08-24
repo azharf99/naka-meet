@@ -762,6 +762,81 @@ func TestAPI_MuteParticipantHandler_UnknownParticipantReturns404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestAPI_IceServersHandler_WithoutTurnConfiguredReturnsStunOnly(t *testing.T) {
+	secret := []byte("api-secret-key")
+	handler := api.NewAPIHandler(secret, nil)
+	// SetTurnConfig deliberately not called — TURN must stay opt-in, never
+	// a hard requirement for a deployment that hasn't set up coturn.
+
+	userID, _ := uuid.NewV7()
+	token, _ := auth.GenerateTokenWithName(userID.String(), "Guest", "guest", secret, time.Hour)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ice-servers", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		IceServers []struct {
+			URLs       []string `json:"urls"`
+			Username   string   `json:"username"`
+			Credential string   `json:"credential"`
+		} `json:"iceServers"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.Len(t, body.IceServers, 1, "no TURN config means exactly the one default STUN entry")
+	assert.Empty(t, body.IceServers[0].Username)
+	assert.Empty(t, body.IceServers[0].Credential)
+}
+
+func TestAPI_IceServersHandler_WithTurnConfiguredIncludesTimeLimitedCredentials(t *testing.T) {
+	secret := []byte("api-secret-key")
+	handler := api.NewAPIHandler(secret, nil)
+	handler.SetTurnConfig("turn-shared-secret", "turn.example.com", "3478")
+
+	userID, _ := uuid.NewV7()
+	token, _ := auth.GenerateTokenWithName(userID.String(), "Guest", "guest", secret, time.Hour)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ice-servers", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		IceServers []struct {
+			URLs       []string `json:"urls"`
+			Username   string   `json:"username"`
+			Credential string   `json:"credential"`
+		} `json:"iceServers"`
+	}
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.Len(t, body.IceServers, 3, "default STUN, coturn's own STUN, and the TURN entry")
+
+	turnEntry := body.IceServers[2]
+	assert.Contains(t, turnEntry.URLs[0], "turn:turn.example.com:3478")
+	assert.NotEmpty(t, turnEntry.Username, "TURN entries need a username, unlike STUN")
+	assert.NotEmpty(t, turnEntry.Credential)
+
+	// The username must decode to the real requester's ID, not a shared or
+	// blank placeholder — this is what would let coturn/an operator trace
+	// relay usage back to a specific session if ever needed.
+	assert.Contains(t, turnEntry.Username, userID.String())
+}
+
+func TestAPI_IceServersHandler_RejectsUnauthenticatedRequest(t *testing.T) {
+	secret := []byte("api-secret-key")
+	handler := api.NewAPIHandler(secret, nil)
+	handler.SetTurnConfig("turn-shared-secret", "turn.example.com", "3478")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ice-servers", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
 func TestAPI_CreateRoomHandler_HostAllowed(t *testing.T) {
 	secret := []byte("api-secret-key")
 	handler := api.NewAPIHandler(secret, nil)

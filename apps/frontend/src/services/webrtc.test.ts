@@ -13,6 +13,14 @@ class MockRTCPeerConnection {
   createAnswer = vi.fn().mockResolvedValue({ type: 'answer', sdp: 'mock-sdp' });
   addIceCandidate = vi.fn().mockResolvedValue(undefined);
   close = vi.fn();
+
+  // Captured so tests can assert connectToken actually passed through
+  // whatever /api/v1/ice-servers returned, rather than always the
+  // hardcoded public-STUN default.
+  iceServers: any;
+  constructor(config?: { iceServers?: any }) {
+    this.iceServers = config?.iceServers;
+  }
 }
 
 class MockWebSocket {
@@ -43,12 +51,51 @@ Object.defineProperty(globalThis, 'navigator', {
   writable: true,
 });
 
+// Default: a deployment with TURN configured, so most tests exercise the
+// real fetched-config path rather than the fallback. Individual tests
+// override this via mockResolvedValueOnce/mockRejectedValueOnce to cover
+// the fallback behavior specifically.
+const mockIceServers = [
+  { urls: ['stun:turn.example.com:3478'] },
+  { urls: ['turn:turn.example.com:3478?transport=udp'], username: 'test-user', credential: 'test-cred' },
+];
+Object.defineProperty(globalThis, 'fetch', {
+  value: vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({ iceServers: mockIceServers }),
+  }),
+  writable: true,
+});
+
 describe('WebRTCService Audit & Unit Tests', () => {
   test('WebRTCService initializes and sets up ICE candidate listener', async () => {
     const service = new WebRTCService('demo-room');
     await service.connectToken('mock-jwt-token');
 
     expect(service).toBeDefined();
+  });
+
+  test('connectToken fetches this deployment\'s ICE servers and passes them to RTCPeerConnection', async () => {
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      '/api/v1/ice-servers',
+      expect.objectContaining({ headers: { Authorization: 'Bearer mock-jwt-token' } })
+    );
+
+    const pc = (service as any).pc as MockRTCPeerConnection;
+    expect(pc.iceServers).toEqual(mockIceServers);
+  });
+
+  test('connectToken falls back to public STUN if the ICE server fetch fails outright', async () => {
+    (globalThis.fetch as any).mockRejectedValueOnce(new Error('network error'));
+
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const pc = (service as any).pc as MockRTCPeerConnection;
+    expect(pc.iceServers).toEqual([{ urls: 'stun:stun.l.google.com:19302' }]);
   });
 
   test('sendMessage relays chat via the signaling WebSocket and echoes it locally', async () => {

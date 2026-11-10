@@ -206,6 +206,18 @@ func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) *SafeCon
 	return oldConn
 }
 
+// IsParticipantConnected reports whether participantID is currently registered
+// in roomSlug. Primarily used by tests to synchronize connection setup.
+func (h *Handler) IsParticipantConnected(roomSlug, participantID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if roomConns, exists := h.conns[roomSlug]; exists {
+		_, connected := roomConns[participantID]
+		return connected
+	}
+	return false
+}
+
 func (h *Handler) unregisterConn(roomSlug, userID string, conn *SafeConn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -541,22 +553,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = h.router.RemovePeer(claims.UserID)
 	}
 
-	// 4. Create PeerConnection in Pion Router
-	pc, err := h.router.AddPeer(claims.UserID)
-	if err != nil {
-		log.Printf("Failed to create PeerConnection: %v", err)
-		return
-	}
-	// SetPeerRoom is deliberately NOT called here. Doing so would make this
-	// peer a valid BroadcastTrackAndRenegotiateWithMetadata target before it
-	// has processed its own initial "offer" below — a concurrent broadcast
-	// could push a server-initiated offer into this still-stable PC, flip it
-	// to HaveLocalOffer, and then the client's real offer arriving via the
-	// message loop would be an invalid SetRemoteDescription transition and
-	// get silently rejected, stranding this peer forever. SetPeerRoom is
-	// called instead once this peer's own offer/answer exchange is durably
-	// complete (see the "offer" case below).
-
 	defer func() {
 		if !h.unregisterConn(roomSlug, claims.UserID, safeConn) {
 			return
@@ -590,6 +586,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
+
+	// 4. Create PeerConnection in Pion Router
+	pc, err := h.router.AddPeer(claims.UserID)
+	if err != nil {
+		log.Printf("Failed to create PeerConnection: %v", err)
+		return
+	}
+	// SetPeerRoom is deliberately NOT called here. Doing so would make this
+	// peer a valid BroadcastTrackAndRenegotiateWithMetadata target before it
+	// has processed its own initial "offer" below — a concurrent broadcast
+	// could push a server-initiated offer into this still-stable PC, flip it
+	// to HaveLocalOffer, and then the client's real offer arriving via the
+	// message loop would be an invalid SetRemoteDescription transition and
+	// get silently rejected, stranding this peer forever. SetPeerRoom is
+	// called instead once this peer's own offer/answer exchange is durably
+	// complete (see the "offer" case below).
 
 	if !p.IsEgress {
 		h.notifyRoomActivity(roomSlug, true)

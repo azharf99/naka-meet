@@ -581,6 +581,9 @@ func TestSignaling_ParticipantLeftBroadcastOnDisconnect(t *testing.T) {
 	wsA, _, err := websocket.DefaultDialer.Dial(wsURLA, nil)
 	require.NoError(t, err)
 	defer wsA.Close()
+	require.Eventually(t, func() bool {
+		return handler.IsParticipantConnected("disconnect-room", userA.String())
+	}, 2*time.Second, 10*time.Millisecond, "User A should finish registering")
 
 	// Connect User B (Guest)
 	userB, _ := uuid.NewV7()
@@ -588,6 +591,9 @@ func TestSignaling_ParticipantLeftBroadcastOnDisconnect(t *testing.T) {
 	wsURLB := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/signaling?room_slug=disconnect-room&token=" + tokenB
 	wsB, _, err := websocket.DefaultDialer.Dial(wsURLB, nil)
 	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return handler.IsParticipantConnected("disconnect-room", userB.String())
+	}, 2*time.Second, 10*time.Millisecond, "User B should finish registering")
 
 	// User B disconnects (closes WS connection)
 	_ = wsB.Close()
@@ -625,6 +631,9 @@ func TestSignaling_RemoveParticipant_SendsRemovedMessageAndDisconnects(t *testin
 	wsA, _, err := websocket.DefaultDialer.Dial(wsURLA, nil)
 	require.NoError(t, err)
 	defer wsA.Close()
+	require.Eventually(t, func() bool {
+		return handler.IsParticipantConnected("remove-room", userA.String())
+	}, 2*time.Second, 10*time.Millisecond, "User A should finish registering")
 
 	userB, _ := uuid.NewV7()
 	tokenB, _ := auth.GenerateTokenWithName(userB.String(), "Guest", "participant", secret, 1*time.Hour)

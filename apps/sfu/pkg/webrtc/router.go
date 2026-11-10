@@ -3,8 +3,11 @@ package webrtc
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/pion/rtcp"
 	pion "github.com/pion/webrtc/v4"
 )
 
@@ -13,6 +16,8 @@ type RoomTrack struct {
 	PublisherName string
 	Kind          string
 	Track         pion.TrackLocal
+	SSRC          pion.SSRC
+	IsVideo       bool
 }
 
 type SFURouter struct {
@@ -27,10 +32,23 @@ type SFURouter struct {
 	mu                   sync.RWMutex
 }
 
-func NewSFURouter(udpMin, udpMax uint16) (*SFURouter, error) {
+func NewSFURouter(udpMin, udpMax uint16, nat1To1IPs ...string) (*SFURouter, error) {
 	settingEngine := pion.SettingEngine{}
 	if err := settingEngine.SetEphemeralUDPPortRange(udpMin, udpMax); err != nil {
 		return nil, fmt.Errorf("failed to set UDP port range (%d-%d): %w", udpMin, udpMax, err)
+	}
+
+	var validNATIPs []string
+	for _, raw := range nat1To1IPs {
+		for _, part := range strings.Split(raw, ",") {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				validNATIPs = append(validNATIPs, trimmed)
+			}
+		}
+	}
+	if len(validNATIPs) > 0 {
+		settingEngine.SetNAT1To1IPs(validNATIPs, pion.ICECandidateTypeHost)
 	}
 
 	mediaEngine := &pion.MediaEngine{}
@@ -68,7 +86,14 @@ func (r *SFURouter) AddPeer(peerID string) (*pion.PeerConnection, error) {
 	defer r.mu.Unlock()
 
 	if pc, exists := r.peers[peerID]; exists {
-		return pc, nil
+		if pc.ConnectionState() == pion.PeerConnectionStateClosed || pc.ConnectionState() == pion.PeerConnectionStateFailed {
+			delete(r.peers, peerID)
+			delete(r.subscribedTracks, peerID)
+			delete(r.pendingRenegotiation, peerID)
+			_ = pc.Close()
+		} else {
+			return pc, nil
+		}
 	}
 
 	config := pion.Configuration{
@@ -245,17 +270,60 @@ func (r *SFURouter) RemovePeer(peerID string) error {
 	return nil
 }
 
+func (r *SFURouter) RequestKeyframe(publisherID string, ssrc pion.SSRC) {
+	r.mu.RLock()
+	pc, exists := r.peers[publisherID]
+	r.mu.RUnlock()
+	if !exists || pc == nil {
+		return
+	}
+	pkts := []rtcp.Packet{
+		&rtcp.PictureLossIndication{
+			MediaSSRC: uint32(ssrc),
+		},
+	}
+	if ssrc != 0 {
+		pkts = append(pkts, &rtcp.PictureLossIndication{MediaSSRC: 0})
+	}
+	_ = pc.WriteRTCP(pkts)
+}
+
+func (r *SFURouter) burstKeyframeRequest(publisherID string, ssrc pion.SSRC) {
+	r.RequestKeyframe(publisherID, ssrc)
+	time.Sleep(300 * time.Millisecond)
+	r.RequestKeyframe(publisherID, ssrc)
+	time.Sleep(700 * time.Millisecond)
+	r.RequestKeyframe(publisherID, ssrc)
+}
+
+func (r *SFURouter) listenRTCP(sender *pion.RTPSender, rt *RoomTrack) {
+	for {
+		packets, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		for _, pkt := range packets {
+			switch pkt.(type) {
+			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+				r.RequestKeyframe(rt.PublisherID, rt.SSRC)
+			}
+		}
+	}
+}
+
 func (r *SFURouter) AddTrackToRoom(roomSlug, publisherID string, track pion.TrackLocal) {
 	r.AddTrackToRoomWithMetadata(roomSlug, publisherID, "", "camera", track)
 }
 
 func (r *SFURouter) AddTrackToRoomWithMetadata(roomSlug, publisherID, publisherName, kind string, track pion.TrackLocal) {
+	isVideo := kind == "camera" || kind == "screen"
 	r.mu.Lock()
 	rt := &RoomTrack{
 		PublisherID:   publisherID,
 		PublisherName: publisherName,
 		Kind:          kind,
 		Track:         track,
+		IsVideo:       isVideo,
 	}
 	r.roomTracks[roomSlug] = append(r.roomTracks[roomSlug], rt)
 	r.mu.Unlock()
@@ -268,12 +336,19 @@ func (r *SFURouter) BroadcastTrackAndRenegotiate(roomSlug, publisherID string, t
 }
 
 func (r *SFURouter) BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publisherName, kind string, track pion.TrackLocal, sendOffer func(peerID, offerSDP string)) {
+	isVideo := kind == "camera" || kind == "screen"
+	r.BroadcastTrackAndRenegotiateWithFullMetadata(roomSlug, publisherID, publisherName, kind, track, 0, isVideo, sendOffer)
+}
+
+func (r *SFURouter) BroadcastTrackAndRenegotiateWithFullMetadata(roomSlug, publisherID, publisherName, kind string, track pion.TrackLocal, ssrc pion.SSRC, isVideo bool, sendOffer func(peerID, offerSDP string)) {
 	r.mu.Lock()
 	rt := &RoomTrack{
 		PublisherID:   publisherID,
 		PublisherName: publisherName,
 		Kind:          kind,
 		Track:         track,
+		SSRC:          ssrc,
+		IsVideo:       isVideo,
 	}
 	r.roomTracks[roomSlug] = append(r.roomTracks[roomSlug], rt)
 
@@ -310,12 +385,19 @@ func (r *SFURouter) BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisher
 		}
 		r.mu.Unlock()
 
-		if _, err := pc.AddTrack(track); err != nil {
+		sender, err := pc.AddTrack(track)
+		if err != nil {
 			r.mu.Lock()
 			r.unmarkSubscribed(peerID, rt)
 			r.mu.Unlock()
 			continue
 		}
+
+		if isVideo && sender != nil {
+			go r.listenRTCP(sender, rt)
+			go r.burstKeyframeRequest(rt.PublisherID, rt.SSRC)
+		}
+
 		r.renegotiatePeer(peerID, sendOffer)
 	}
 }
@@ -351,7 +433,12 @@ func (r *SFURouter) SubscribePeerToRoomTracks(roomSlug, peerID string, onSubscri
 		if !r.markSubscribed(peerID, rt) {
 			continue
 		}
-		if _, err := pc.AddTrack(rt.Track); err == nil {
+		sender, err := pc.AddTrack(rt.Track)
+		if err == nil {
+			if rt.IsVideo && sender != nil {
+				go r.listenRTCP(sender, rt)
+				go r.burstKeyframeRequest(rt.PublisherID, rt.SSRC)
+			}
 			if onSubscribe != nil {
 				onSubscribe(rt)
 			}

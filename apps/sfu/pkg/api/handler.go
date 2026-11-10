@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/mail"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +74,11 @@ type APIHandler struct {
 
 	authLimiters  map[string]*rate.Limiter
 	authLimiterMu sync.Mutex
+	recordingsDir string
+}
+
+func (h *APIHandler) SetRecordingsDir(dir string) {
+	h.recordingsDir = dir
 }
 
 func NewAPIHandler(jwtSecret []byte, publisher RedisPublisher) *APIHandler {
@@ -303,6 +312,18 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 7d. Room Recordings List: GET /api/v1/rooms/:slug/recordings
+	if strings.HasPrefix(path, "/api/v1/rooms/") && strings.HasSuffix(path, "/recordings") && r.Method == http.MethodGet {
+		h.handleListRecordings(w, r)
+		return
+	}
+
+	// 7e. Room Recording Download/Stream: GET /api/v1/rooms/:slug/recordings/:filename
+	if strings.HasPrefix(path, "/api/v1/rooms/") && strings.Contains(path, "/recordings/") && r.Method == http.MethodGet {
+		h.handleDownloadRecording(w, r)
+		return
+	}
+
 	// 8. Get Room Info Endpoint (/api/v1/rooms/:slug)
 	if strings.HasPrefix(path, "/api/v1/rooms/") && r.Method == http.MethodGet {
 		h.handleGetRoom(w, r)
@@ -447,6 +468,7 @@ func (h *APIHandler) handleMe(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
+		"token":   cookie.Value,
 		"user_id": claims.UserID,
 		"name":    claims.Name,
 		"role":    claims.Role,
@@ -587,8 +609,12 @@ func (h *APIHandler) handleEgressTrigger(w http.ResponseWriter, r *http.Request)
 		switch action {
 		case "START_RECORDING":
 			h.recordingBroadcast(roomSlug, true, "recording")
+		case "STOP_RECORDING":
+			h.recordingBroadcast(roomSlug, false, "recording")
 		case "START_RTMP":
 			h.recordingBroadcast(roomSlug, true, "rtmp")
+		case "STOP_RTMP":
+			h.recordingBroadcast(roomSlug, false, "rtmp")
 		case "STOP_EGRESS":
 			h.recordingBroadcast(roomSlug, false, "")
 		}
@@ -600,6 +626,107 @@ func (h *APIHandler) handleEgressTrigger(w http.ResponseWriter, r *http.Request)
 		"action": action,
 		"room":   roomSlug,
 	})
+}
+
+type RecordingItem struct {
+	Filename    string    `json:"filename"`
+	Size        int64     `json:"size"`
+	CreatedAt   time.Time `json:"created_at"`
+	DownloadURL string    `json:"download_url"`
+}
+
+func (h *APIHandler) getRecordingsDir() string {
+	if h.recordingsDir != "" {
+		return h.recordingsDir
+	}
+	if envDir := os.Getenv("RECORDINGS_DIR"); envDir != "" {
+		return envDir
+	}
+	return "./recordings"
+}
+
+func (h *APIHandler) handleListRecordings(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/rooms/")
+	roomSlug := strings.TrimSuffix(trimmed, "/recordings")
+	if roomSlug == "" {
+		http.Error(w, "Bad Request: missing room slug", http.StatusBadRequest)
+		return
+	}
+
+	claims := h.extractAndValidateToken(r)
+	if !h.isRoomHost(claims, roomSlug) {
+		http.Error(w, "Forbidden: Host authority required for this room", http.StatusForbidden)
+		return
+	}
+
+	dir := h.getRecordingsDir()
+	entries, err := os.ReadDir(dir)
+	var recordings []RecordingItem
+	if err == nil {
+		prefix := roomSlug + "_"
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".mp4") {
+				info, err := entry.Info()
+				var size int64
+				modTime := time.Now()
+				if err == nil {
+					size = info.Size()
+					modTime = info.ModTime()
+				}
+				recordings = append(recordings, RecordingItem{
+					Filename:    entry.Name(),
+					Size:        size,
+					CreatedAt:   modTime,
+					DownloadURL: "/api/v1/rooms/" + roomSlug + "/recordings/" + url.PathEscape(entry.Name()),
+				})
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"recordings": recordings,
+	})
+}
+
+func (h *APIHandler) handleDownloadRecording(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/rooms/")
+	parts := strings.SplitN(trimmed, "/recordings/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	roomSlug, filename := parts[0], parts[1]
+	unescapedFile, err := url.PathUnescape(filename)
+	if err != nil {
+		unescapedFile = filename
+	}
+
+	claims := h.extractAndValidateToken(r)
+	if !h.isRoomHost(claims, roomSlug) {
+		http.Error(w, "Forbidden: Host authority required for this room", http.StatusForbidden)
+		return
+	}
+
+	// Path traversal protection
+	base := filepath.Base(unescapedFile)
+	if base != unescapedFile || !strings.HasPrefix(base, roomSlug+"_") || !strings.HasSuffix(base, ".mp4") {
+		http.Error(w, "Bad Request: invalid filename", http.StatusBadRequest)
+		return
+	}
+
+	dir := h.getRecordingsDir()
+	fullPath := filepath.Join(dir, base)
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		http.Error(w, "Recording not found", http.StatusNotFound)
+		return
+	}
+
+	if r.URL.Query().Get("download") == "true" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", base))
+	}
+	w.Header().Set("Content-Type", "video/mp4")
+	http.ServeFile(w, r, fullPath)
 }
 
 // handleRemoveParticipant is the moderation "kick" endpoint (BR1: host
@@ -800,10 +927,10 @@ func (h *APIHandler) isRoomHost(claims *auth.Claims, roomSlug string) bool {
 
 func (h *APIHandler) extractAndValidateToken(r *http.Request) *auth.Claims {
 	var tokenStr string
-	if cookie, err := r.Cookie("jwt_token"); err == nil && cookie.Value != "" {
-		tokenStr = cookie.Value
-	} else if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 		tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+	} else if cookie, err := r.Cookie("jwt_token"); err == nil && cookie.Value != "" {
+		tokenStr = cookie.Value
 	}
 	if tokenStr == "" {
 		return nil

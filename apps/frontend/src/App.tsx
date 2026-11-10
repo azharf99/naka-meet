@@ -3,8 +3,8 @@ import { WebRTCService, ParticipantTrack } from './services/webrtc';
 import { guestJoin, getSession, logout } from './services/auth';
 import { VideoGrid } from './components/VideoGrid';
 import { Controls } from './components/Controls';
-import { Lobby, HostSession } from './components/Lobby';
-import { Send, X, ShieldCheck, UserCheck, LogOut, UserX } from 'lucide-react';
+import { Lobby, HostSession, JoinMediaOptions } from './components/Lobby';
+import { Send, X, ShieldCheck, UserCheck, LogOut, UserX, FolderDown, Download } from 'lucide-react';
 
 // How long the egress worker's readiness poll (apps/egress/worker.js's
 // waitForEgressReady) is willing to wait for a real participant to show up
@@ -33,6 +33,9 @@ export const App: React.FC = () => {
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const [remoteTracks, setRemoteTracks] = useState<ParticipantTrack[]>([]);
   const [remoteMediaState, setRemoteMediaState] = useState<Map<string, { mic: boolean; cam: boolean }>>(new Map());
+  const [roomPeers, setRoomPeers] = useState<Array<{ peer_id: string; peer_name: string }>>([]);
+  const [initialMicOn, setInitialMicOn] = useState<boolean>(true);
+  const [initialCamOn, setInitialCamOn] = useState<boolean>(true);
   // Keyed the same way as remoteMediaState (by peerID/display name) — true
   // while the server's RTP-liveness watchdog has flagged that publisher's
   // track as silent (frozen video that isn't recovering on its own).
@@ -62,12 +65,24 @@ export const App: React.FC = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isLiveStreaming, setIsLiveStreaming] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [showRecordingsModal, setShowRecordingsModal] = useState(false);
+  const [recordingsList, setRecordingsList] = useState<Array<{ filename: string; size: number; mod_time: string }>>([]);
+  const [loadingRecordings, setLoadingRecordings] = useState(false);
 
   const [restoredHostSession, setRestoredHostSession] = useState<HostSession | null>(null);
   const [sessionChecked, setSessionChecked] = useState(false);
 
-  const handleJoinRoom = async (name: string, targetRoomSlug: string, role: string) => {
+  const handleJoinRoom = async (
+    name: string,
+    targetRoomSlug: string,
+    role: string,
+    options?: JoinMediaOptions
+  ) => {
     try {
+      if (options) {
+        setInitialMicOn(options.micOn);
+        setInitialCamOn(options.camOn);
+      }
       const authData = await guestJoin(name, targetRoomSlug, role);
       setToken(authData.token);
       setUserRole(authData.role || role);
@@ -85,7 +100,15 @@ export const App: React.FC = () => {
   // Called by Lobby once a host has authenticated (login/signup, or a
   // restored cookie session) AND the room has already been created — auth
   // and room-ownership are Lobby's concern, App just enters the meeting.
-  const handleEnterAsHost = (session: HostSession, activeSlug: string) => {
+  const handleEnterAsHost = (
+    session: HostSession,
+    activeSlug: string,
+    options?: JoinMediaOptions
+  ) => {
+    if (options) {
+      setInitialMicOn(options.micOn);
+      setInitialCamOn(options.camOn);
+    }
     setToken(session.token);
     setUserRole(session.role || 'host');
     setLocalPeerId(session.user_id);
@@ -110,7 +133,7 @@ export const App: React.FC = () => {
         // that follows uses credentials:'include', and the backend already
         // prefers the cookie over an empty/missing Bearer header, so this
         // still authenticates correctly for both REST and the WS handshake.
-        setRestoredHostSession({ token: '', name: session.name, role: session.role, user_id: session.user_id });
+        setRestoredHostSession({ token: session.token || '', name: session.name, role: session.role, user_id: session.user_id });
       }
       setSessionChecked(true);
     });
@@ -143,6 +166,7 @@ export const App: React.FC = () => {
     setLocalScreenStream(null);
     setIsScreenSharing(false);
     setRemoteTracks([]);
+    setRoomPeers([]);
     setMessages([]);
     setConnectionLost(false);
     setConnectionRejected(false);
@@ -156,7 +180,7 @@ export const App: React.FC = () => {
   };
 
   useEffect(() => {
-    if (!inMeeting || !token || !roomSlug) return;
+    if (!inMeeting || !roomSlug) return;
 
     let activeService: WebRTCService | null = null;
 
@@ -261,7 +285,38 @@ export const App: React.FC = () => {
           setRecordingConsent(active ? { active, kind } : null);
         };
 
-        await service.connectToken(token);
+        service.onRoomPeers = (peers) => {
+          setRoomPeers(
+            peers.filter(
+              (p) =>
+                !p.peer_name?.toLowerCase().includes('egress') &&
+                !p.peer_id?.toLowerCase().includes('egress')
+            )
+          );
+        };
+
+        service.onTrackMetadataUpdated = (meta) => {
+          if (meta.track_id && (meta.peer_name || meta.peer_id)) {
+            setRemoteTracks((prev) =>
+              prev.map((t) => {
+                if (t.id === meta.track_id) {
+                  return {
+                    ...t,
+                    peerID: meta.peer_name || t.peerID,
+                    rawPeerId: meta.peer_id || t.rawPeerId,
+                  };
+                }
+                return t;
+              })
+            );
+          }
+        };
+
+        await service.connectToken(token, {
+          isEgress: userRole === 'egress',
+          initialMicOn,
+          initialCamOn,
+        });
         setConnectionLost(false);
         setLocalStream(service.getLocalStream());
         setWebrtcService(service);
@@ -275,7 +330,7 @@ export const App: React.FC = () => {
     return () => {
       activeService?.disconnect();
     };
-  }, [inMeeting, token, roomSlug]);
+  }, [inMeeting, token, roomSlug, initialMicOn, initialCamOn]);
 
   // Signals the egress worker (apps/egress/worker.js's waitForEgressReady)
   // that it's safe to start FFmpeg: either a real remote track has already
@@ -317,10 +372,12 @@ export const App: React.FC = () => {
       if (res.ok) {
         if (action === 'START_RECORDING') {
           setIsRecording(true);
-          setIsLiveStreaming(false);
+        } else if (action === 'STOP_RECORDING') {
+          setIsRecording(false);
         } else if (action === 'START_RTMP') {
           setIsLiveStreaming(true);
-          setIsRecording(false);
+        } else if (action === 'STOP_RTMP') {
+          setIsLiveStreaming(false);
         } else if (action === 'STOP_EGRESS') {
           setIsRecording(false);
           setIsLiveStreaming(false);
@@ -334,8 +391,28 @@ export const App: React.FC = () => {
   };
 
   const handleStartRecording = () => sendEgressCommand('START_RECORDING');
+  const handleStopRecording = () => sendEgressCommand('STOP_RECORDING');
   const handleStartRTMP = (url: string) => sendEgressCommand('START_RTMP', url);
+  const handleStopRTMP = () => sendEgressCommand('STOP_RTMP');
   const handleStopEgress = () => sendEgressCommand('STOP_EGRESS');
+
+  const fetchRecordings = async () => {
+    setLoadingRecordings(true);
+    try {
+      const res = await fetch(`/api/v1/rooms/${roomSlug}/recordings`, {
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'include',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setRecordingsList(data.recordings || []);
+      }
+    } catch (err) {
+      console.error('Failed to load recordings', err);
+    } finally {
+      setLoadingRecordings(false);
+    }
+  };
 
   // Host-only moderation action. The target actually disconnects via the
   // signaling WebSocket server-side (see signaling.Handler.RemoveParticipant)
@@ -405,49 +482,51 @@ export const App: React.FC = () => {
 
   return (
     <div className="flex h-screen w-screen bg-slate-950 text-slate-100 overflow-hidden relative">
-      {/* Top Header */}
-      <header className="absolute top-0 left-0 right-0 h-16 glass-panel border-b border-slate-800/80 px-6 flex items-center justify-between z-40">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/20">
-            N
+      {/* Top Header - hidden for headless Egress recorder */}
+      {userRole !== 'egress' && (
+        <header className="absolute top-0 left-0 right-0 h-16 glass-panel border-b border-slate-800/80 px-6 flex items-center justify-between z-40">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/20">
+              N
+            </div>
+            <div>
+              <h1 className="font-semibold text-sm tracking-wide text-slate-100">Naka Meet</h1>
+              <p className="text-xs text-slate-400 flex items-center gap-1">
+                Room: <span className="text-indigo-400 font-mono">{roomSlug}</span>
+              </p>
+            </div>
           </div>
-          <div>
-            <h1 className="font-semibold text-sm tracking-wide text-slate-100">Naka Meet</h1>
-            <p className="text-xs text-slate-400 flex items-center gap-1">
-              Room: <span className="text-indigo-400 font-mono">{roomSlug}</span>
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-3">
-          {displayName && (
-            <span className="px-3 py-1 bg-slate-800/80 text-slate-300 border border-slate-700/60 rounded-full text-xs font-medium">
-              {displayName}
+          <div className="flex items-center gap-3">
+            {displayName && (
+              <span className="px-3 py-1 bg-slate-800/80 text-slate-300 border border-slate-700/60 rounded-full text-xs font-medium">
+                {displayName}
+              </span>
+            )}
+            <span className="px-3 py-1 bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded-full text-xs font-medium flex items-center gap-1.5 capitalize">
+              <UserCheck className="w-3.5 h-3.5" /> Role: {userRole}
             </span>
-          )}
-          <span className="px-3 py-1 bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded-full text-xs font-medium flex items-center gap-1.5 capitalize">
-            <UserCheck className="w-3.5 h-3.5" /> Role: {userRole}
-          </span>
-          <span className="px-3 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-full text-xs font-medium flex items-center gap-1.5">
-            <ShieldCheck className="w-3.5 h-3.5" /> WebRTC SFU Active
-          </span>
-          {userRole === 'host' && (
-            <button
-              onClick={() => {
-                logout();
-                setRestoredHostSession(null);
-                handleLeaveRoom();
-              }}
-              className="p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 rounded-full transition-colors"
-              title="Log out"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-            </button>
-          )}
-        </div>
-      </header>
+            <span className="px-3 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-full text-xs font-medium flex items-center gap-1.5">
+              <ShieldCheck className="w-3.5 h-3.5" /> WebRTC SFU Active
+            </span>
+            {userRole === 'host' && (
+              <button
+                onClick={() => {
+                  logout();
+                  setRestoredHostSession(null);
+                  handleLeaveRoom();
+                }}
+                className="p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 rounded-full transition-colors"
+                title="Log out"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        </header>
+      )}
 
       {/* Main Video Area */}
-      <main className="flex-1 flex pt-16 relative">
+      <main className={`flex-1 flex ${userRole === 'egress' ? 'pt-0' : 'pt-16'} relative`}>
         <VideoGrid
           localStream={localStream}
           localScreenStream={localScreenStream}
@@ -461,6 +540,7 @@ export const App: React.FC = () => {
           localPeerId={localPeerId}
           activePresentation={activePresentation}
           onSetPresentation={userRole === 'host' ? handleSetPresentation : undefined}
+          roomPeers={roomPeers}
         />
 
         {/* Removal takeover notice: unlike a dropped connection, there's
@@ -564,48 +644,120 @@ export const App: React.FC = () => {
         )}
       </main>
 
-      {/* Control Bar */}
-      <Controls
-        userRole={userRole}
-        isRecording={isRecording}
-        isLiveStreaming={isLiveStreaming}
-        isScreenSharing={isScreenSharing}
-        forceMuteSignal={forceMuteSignal}
-        onToggleMic={() => {
-          if (localStream) {
-            localStream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
-            const nowEnabled = localStream.getAudioTracks()[0]?.enabled ?? true;
-            webrtcService?.sendMediaState('mic', nowEnabled);
-          }
-        }}
-        onToggleCam={() => {
-          if (localStream) {
-            localStream.getVideoTracks().forEach((t) => (t.enabled = !t.enabled));
-            const nowEnabled = localStream.getVideoTracks()[0]?.enabled ?? true;
-            webrtcService?.sendMediaState('cam', nowEnabled);
-          }
-        }}
-        onScreenShare={async () => {
-          const screenStream = await webrtcService?.startScreenShare();
-          if (screenStream) {
-            setLocalScreenStream(screenStream);
-            setIsScreenSharing(true);
-          }
-        }}
-        onStopScreenShare={() => {
-          webrtcService?.stopScreenShare();
-          setLocalScreenStream(null);
-          setIsScreenSharing(false);
-        }}
-        onToggleChat={() => setChatOpen(!chatOpen)}
-        onStartRecording={handleStartRecording}
-        onStartRTMP={handleStartRTMP}
-        onStopEgress={handleStopEgress}
-        onLeave={handleLeaveRoom}
-      />
+      {/* Control Bar - hidden for headless Egress recorder */}
+      {userRole !== 'egress' && (
+        <Controls
+          userRole={userRole}
+          isRecording={isRecording}
+          isLiveStreaming={isLiveStreaming}
+          isScreenSharing={isScreenSharing}
+          forceMuteSignal={forceMuteSignal}
+          initialMicOn={initialMicOn}
+          initialCamOn={initialCamOn}
+          onToggleMic={() => {
+            if (localStream) {
+              localStream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
+              const nowEnabled = localStream.getAudioTracks()[0]?.enabled ?? true;
+              webrtcService?.sendMediaState('mic', nowEnabled);
+            }
+          }}
+          onToggleCam={() => {
+            if (localStream) {
+              localStream.getVideoTracks().forEach((t) => (t.enabled = !t.enabled));
+              const nowEnabled = localStream.getVideoTracks()[0]?.enabled ?? true;
+              webrtcService?.sendMediaState('cam', nowEnabled);
+            }
+          }}
+          onScreenShare={async () => {
+            const screenStream = await webrtcService?.startScreenShare();
+            if (screenStream) {
+              setLocalScreenStream(screenStream);
+              setIsScreenSharing(true);
+            }
+          }}
+          onStopScreenShare={() => {
+            webrtcService?.stopScreenShare();
+            setLocalScreenStream(null);
+            setIsScreenSharing(false);
+          }}
+          onToggleChat={() => setChatOpen(!chatOpen)}
+          onStartRecording={handleStartRecording}
+          onStopRecording={handleStopRecording}
+          onStartRTMP={handleStartRTMP}
+          onStopRTMP={handleStopRTMP}
+          onStopEgress={handleStopEgress}
+          onOpenRecordings={() => {
+            setShowRecordingsModal(true);
+            fetchRecordings();
+          }}
+          onLeave={handleLeaveRoom}
+        />
+      )}
 
+      {/* Recordings Modal */}
+      {showRecordingsModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-lg shadow-2xl relative">
+            <button
+              onClick={() => setShowRecordingsModal(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-slate-200"
+            >
+              <X className="w-5 h-5" />
+            </button>
 
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-400">
+                <FolderDown className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-semibold text-slate-100 text-base">Recorded Meetings</h3>
+                <p className="text-xs text-slate-400">Daftar rekaman MP4 yang disimpan di server</p>
+              </div>
+            </div>
 
+            {loadingRecordings ? (
+              <div className="py-8 text-center text-xs text-slate-400">Memuat rekaman...</div>
+            ) : recordingsList.length === 0 ? (
+              <div className="py-8 text-center text-xs text-slate-400">
+                Belum ada rekaman tersimpan untuk room ini.
+              </div>
+            ) : (
+              <div className="max-h-72 overflow-y-auto space-y-2 pr-1">
+                {recordingsList.map((rec) => (
+                  <div
+                    key={rec.filename}
+                    className="p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl flex items-center justify-between text-xs"
+                  >
+                    <div className="truncate mr-3">
+                      <p className="font-medium text-slate-200 truncate">{rec.filename}</p>
+                      <p className="text-[11px] text-slate-400">
+                        {(rec.size / (1024 * 1024)).toFixed(2)} MB • {new Date(rec.created_at || rec.mod_time || Date.now()).toLocaleString()}
+                      </p>
+                    </div>
+                    <a
+                      href={`/api/v1/rooms/${roomSlug}/recordings/${encodeURIComponent(rec.filename)}?download=true`}
+                      download
+                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-medium flex items-center gap-1.5 shrink-0 transition-colors"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Download</span>
+                    </a>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex justify-end pt-4">
+              <button
+                onClick={() => setShowRecordingsModal(false)}
+                className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-slate-200 bg-slate-800 rounded-xl"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

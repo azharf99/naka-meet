@@ -24,7 +24,6 @@ function resolveOutputPath(roomSlug, action, customUrl = '') {
 
 
 function buildFFmpegArgs(roomSlug, outputUrl = 'output.mp4', options = {}) {
-
   const display = process.env.DISPLAY || ':99';
   // audioSource picks the ffmpeg audio input: 'pulse' captures real page
   // audio from the PulseAudio null-sink Chromium's output is routed to
@@ -37,11 +36,11 @@ function buildFFmpegArgs(roomSlug, outputUrl = 'output.mp4', options = {}) {
 
   let audioInputArgs;
   if (audioSource === 'dummy') {
-    audioInputArgs = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'];
+    audioInputArgs = ['-thread_queue_size', '1024', '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'];
   } else if (audioSource === 'alsa') {
-    audioInputArgs = ['-f', 'alsa', '-i', 'default'];
+    audioInputArgs = ['-thread_queue_size', '1024', '-f', 'alsa', '-i', 'default'];
   } else {
-    audioInputArgs = ['-f', 'pulse', '-i', `${pulseSink}.monitor`];
+    audioInputArgs = ['-thread_queue_size', '1024', '-f', 'pulse', '-i', `${pulseSink}.monitor`];
   }
 
   const isRTMP = outputUrl.startsWith('rtmp://') || outputUrl.startsWith('rtmps://');
@@ -49,6 +48,7 @@ function buildFFmpegArgs(roomSlug, outputUrl = 'output.mp4', options = {}) {
 
   return [
     '-y',
+    '-thread_queue_size', '1024',
     '-f', 'x11grab',
     '-draw_mouse', '0',
     '-s', '1920x1080',
@@ -87,7 +87,13 @@ async function waitForEgressReady(page, { timeoutMs = 15000, pollIntervalMs = 25
   for (;;) {
     let ready = false;
     try {
-      ready = await page.evaluate(() => !!window.__egressReady);
+      ready = await page.evaluate(() => {
+        if (typeof window === 'undefined') return false;
+        if (window.__egressReady) return true;
+        const videos = Array.from(document.querySelectorAll('video'));
+        const remoteVideos = videos.filter((v) => !v.muted && v.readyState >= 2 && v.videoWidth > 0);
+        return remoteVideos.length > 0;
+      });
     } catch (e) {
       // page.evaluate can throw if the page navigated or closed mid-poll —
       // treat as not-ready-yet rather than crashing the recording start.
@@ -123,10 +129,21 @@ class EgressWorker {
 
     this.onCommand = onCommand;
     this.logStderr = logStderr;
-    this.ffmpegProcess = null;
+    this.recordingProcess = null;
+    this.rtmpProcess = null;
     this.browser = null;
+    this.page = null;
     this.autoStopTimer = null;
     this.activeRoom = null;
+    this.isStopping = false;
+  }
+
+  get ffmpegProcess() {
+    return this.recordingProcess || this.rtmpProcess;
+  }
+
+  set ffmpegProcess(proc) {
+    this.recordingProcess = proc;
   }
 
   async startListening() {
@@ -153,16 +170,39 @@ class EgressWorker {
     const action = command.action;
     const roomSlug = command.room || 'demo-room';
 
-    if (action === 'START_RECORDING' || action === 'START_RTMP') {
+    if (action === 'START_RECORDING') {
       const outputUrl = resolveOutputPath(roomSlug, action, command.url);
-      await this.startRecording(roomSlug, outputUrl);
+      await this.startCapture(roomSlug, 'recording', outputUrl);
+    } else if (action === 'STOP_RECORDING') {
+      this.stopCapture('recording');
+    } else if (action === 'START_RTMP') {
+      const outputUrl = resolveOutputPath(roomSlug, action, command.url);
+      await this.startCapture(roomSlug, 'rtmp', outputUrl);
+    } else if (action === 'STOP_RTMP') {
+      this.stopCapture('rtmp');
     } else if (action === 'STOP_EGRESS') {
-      console.log(`🛑 Stopping Egress for room ${roomSlug}...`);
+      console.log(`🛑 Stopping all Egress for room ${roomSlug}...`);
       this.stopGracefully('SIGINT');
+    } else if (action === 'ROOM_EMPTY') {
+      console.log(`⚠️ Room ${roomSlug} is empty. Scheduling auto-stop in 5 minutes...`);
+      if (this.autoStopTimer) clearTimeout(this.autoStopTimer);
+      this.autoStopTimer = setTimeout(() => {
+        console.log(`⏰ 5 minutes empty room reached. Stopping Egress for ${roomSlug}`);
+        this.stopGracefully('SIGINT');
+      }, 5 * 60 * 1000);
+    } else if (action === 'ROOM_ACTIVE') {
+      if (this.autoStopTimer) {
+        console.log(`👤 Participant active in room ${roomSlug}. Cancelling empty-room timer.`);
+        clearTimeout(this.autoStopTimer);
+        this.autoStopTimer = null;
+      }
     }
   }
 
-  async startRecording(roomSlug, outputUrl) {
+  async ensureBrowser(roomSlug) {
+    if (this.browser && this.page && this.activeRoom === roomSlug) {
+      return;
+    }
     this.activeRoom = roomSlug;
     const frontendHost = process.env.FRONTEND_URL || 'http://frontend:3000';
     const targetUrl = `${frontendHost}?room=${roomSlug}&role=egress`;
@@ -172,35 +212,32 @@ class EgressWorker {
       this.browser = await puppeteer.launch({
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         headless: false,
+        ignoreDefaultArgs: ['--enable-automation'],
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
+          '--disable-infobars',
+          `--unsafely-treat-insecure-origin-as-secure=${frontendHost}`,
           '--autoplay-policy=no-user-gesture-required',
           '--window-size=1920,1080',
           '--window-position=0,0',
-          // --start-fullscreen relies on a window manager to actually resize
-          // and reposition the window; there is none under bare Xvfb, so it
-          // can silently no-op and leave Chrome's tab/URL bar on screen,
-          // shrinking the actual page content within the x11grab capture.
-          // --kiosk removes all browser chrome and forces the window to
-          // fill window-size without needing a WM to negotiate it.
           '--kiosk',
           `--display=${process.env.DISPLAY || ':99'}`,
         ],
         defaultViewport: { width: 1920, height: 1080 },
       });
 
-      const page = await this.browser.newPage();
+      this.page = await this.browser.newPage();
       let pageLoaded = true;
-      await page.goto(targetUrl, { waitUntil: 'networkidle2' }).catch(() => {
+      await this.page.goto(targetUrl, { waitUntil: 'networkidle2' }).catch(() => {
         pageLoaded = false;
         console.warn(`Could not reach ${targetUrl}, rendering browser viewport on :99`);
       });
 
       if (pageLoaded) {
         console.log('⏳ Waiting for egress page readiness signal before starting FFmpeg...');
-        const ready = await waitForEgressReady(page, {
+        const ready = await waitForEgressReady(this.page, {
           timeoutMs: this.egressReadyTimeoutMs,
           pollIntervalMs: this.egressReadyPollMs,
         }).catch(() => false);
@@ -213,68 +250,121 @@ class EgressWorker {
     } catch (err) {
       console.warn('Puppeteer launch skipped or failed, proceeding with screen capture:', err.message);
     }
+  }
+
+  async startCapture(roomSlug, mode, outputUrl) {
+    if (mode === 'recording' && this.recordingProcess) {
+      console.log('Recording is already running for room', roomSlug);
+      return;
+    }
+    if (mode === 'rtmp' && this.rtmpProcess) {
+      console.log('RTMP stream is already running for room', roomSlug);
+      return;
+    }
+
+    await this.ensureBrowser(roomSlug);
 
     const args = buildFFmpegArgs(roomSlug, outputUrl, { audioSource: 'pulse' });
-    console.log(`🎥 Launching FFmpeg recording for room ${roomSlug} -> ${outputUrl}`);
+    console.log(`🎥 Launching FFmpeg (${mode}) for room ${roomSlug} -> ${outputUrl}`);
 
-    this.ffmpegProcess = spawn('ffmpeg', args);
+    const proc = spawn('ffmpeg', args);
 
-    this.ffmpegProcess.stdout?.on('data', (data) => {
-      console.log(`[FFmpeg STDOUT] ${data}`);
+    if (mode === 'recording') {
+      this.recordingProcess = proc;
+    } else {
+      this.rtmpProcess = proc;
+    }
+
+    proc.stdout?.on('data', (data) => {
+      console.log(`[FFmpeg ${mode} STDOUT] ${data}`);
     });
 
-    this.ffmpegProcess.stderr?.on('data', (data) => {
+    proc.stderr?.on('data', (data) => {
       const msg = data.toString();
       if (this.logStderr) {
         this.logStderr(msg);
       } else {
-        console.error(`[FFmpeg STDERR] ${msg}`);
+        console.error(`[FFmpeg ${mode} STDERR] ${msg}`);
       }
     });
 
-    this.ffmpegProcess.on('close', (code, signal) => {
+    proc.on('close', (code, signal) => {
       const isGraceful = code === 0 || code === 255 || signal === 'SIGINT' || this.isStopping;
       if (isGraceful) {
-        console.log(`✅ FFmpeg recording finished gracefully (exit code ${code}, signal ${signal || 'SIGINT'}) - metadata headers finalized.`);
+        console.log(`✅ FFmpeg ${mode} finished gracefully (exit code ${code}, signal ${signal || 'SIGINT'}) - metadata headers finalized.`);
       } else {
-        console.error(`❌ FFmpeg process exited unexpectedly with code ${code}, signal ${signal}`);
+        console.error(`❌ FFmpeg ${mode} process exited unexpectedly with code ${code}, signal ${signal}`);
       }
-      this.ffmpegProcess = null;
-      this.isStopping = false;
+
+      if (mode === 'recording') {
+        this.recordingProcess = null;
+      } else {
+        this.rtmpProcess = null;
+      }
+
+      if (!this.recordingProcess && !this.rtmpProcess) {
+        this.closeBrowser();
+      }
+
       if (this.redisPubClient && typeof this.redisPubClient.publish === 'function') {
-        this.redisPubClient.publish('channel:egress_status', JSON.stringify({ status: 'completed', room: roomSlug })).catch(() => {});
+        this.redisPubClient.publish('channel:egress_status', JSON.stringify({ status: 'completed', mode, room: roomSlug })).catch(() => {});
       }
     });
-
-    // BR2: Auto-stop after 5 minutes empty room
-    if (this.autoStopTimer) clearTimeout(this.autoStopTimer);
-    this.autoStopTimer = setTimeout(() => {
-      console.log('⏰ 5 minutes timeout reached, auto-stopping Egress Worker to save CPU');
-      this.stopGracefully('SIGINT');
-    }, 5 * 60 * 1000);
   }
 
-  // BR2: Must use SIGINT so MP4/FLV metadata header is properly written
-  stopGracefully(signal = 'SIGINT') {
-    this.isStopping = true;
+  async startRecording(roomSlug, outputUrl) {
+    return this.startCapture(roomSlug, 'recording', outputUrl);
+  }
+
+  stopCapture(mode, signal = 'SIGINT') {
+    const proc = mode === 'recording' ? this.recordingProcess : this.rtmpProcess;
+    if (proc) {
+      console.log(`Sending ${signal} signal to FFmpeg (${mode}) for graceful closing...`);
+      try {
+        proc.kill(signal);
+      } catch (e) {}
+      if (mode === 'recording') {
+        this.recordingProcess = null;
+      } else {
+        this.rtmpProcess = null;
+      }
+    }
+    if (!this.recordingProcess && !this.rtmpProcess) {
+      this.closeBrowser();
+    }
+  }
+
+  closeBrowser() {
     if (this.autoStopTimer) {
       clearTimeout(this.autoStopTimer);
       this.autoStopTimer = null;
     }
-
-    if (this.ffmpegProcess) {
-      console.log(`Sending ${signal} signal to FFmpeg for graceful header closing...`);
-      try {
-        this.ffmpegProcess.kill(signal);
-      } catch (e) {}
-      this.ffmpegProcess = null;
-    }
-
-
     if (this.browser) {
       this.browser.close().catch(() => {});
       this.browser = null;
+      this.page = null;
     }
+  }
+
+  stopGracefully(signal = 'SIGINT') {
+    this.isStopping = true;
+    if (this.recordingProcess) {
+      console.log(`Sending ${signal} signal to FFmpeg recording for graceful header closing...`);
+      try {
+        this.recordingProcess.kill(signal);
+      } catch (e) {}
+      this.recordingProcess = null;
+    }
+    if (this.rtmpProcess) {
+      console.log(`Sending ${signal} signal to FFmpeg rtmp for graceful header closing...`);
+      try {
+        this.rtmpProcess.kill(signal);
+      } catch (e) {}
+      this.rtmpProcess = null;
+    }
+
+    this.closeBrowser();
+    this.isStopping = false;
   }
 
   async stop() {

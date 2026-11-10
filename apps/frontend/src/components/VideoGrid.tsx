@@ -35,6 +35,34 @@ interface VideoGridProps {
   // share, as the room's active presentation. Present only for the host
   // role, matching onRemoveParticipant's contract.
   onSetPresentation?: (peerId: string) => void;
+  // Full list of room peers returned by the SFU get_peers signaling
+  roomPeers?: Array<{ peer_id: string; peer_name: string }>;
+  // Set of participant rawPeerIds or names currently speaking
+  activeSpeakerIds?: Set<string>;
+}
+
+export function formatParticipantLabel(
+  peerID: string,
+  rawPeerId?: string,
+  roomPeers?: Array<{ peer_id: string; peer_name: string }>
+): string {
+  if (rawPeerId && roomPeers) {
+    const found = roomPeers.find((p) => p.peer_id === rawPeerId);
+    if (found && found.peer_name) {
+      return found.peer_name;
+    }
+  }
+  if (peerID) {
+    if (peerID.startsWith('stream-')) {
+      return 'Participant';
+    }
+    // If it's a UUID, format as User xxxxx
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(peerID)) {
+      return `User ${peerID.slice(0, 6)}`;
+    }
+    return peerID;
+  }
+  return 'Participant';
 }
 
 export function getGridClass(totalTiles: number): string {
@@ -50,7 +78,10 @@ export function getGridClass(totalTiles: number): string {
   if (totalTiles <= 9) {
     return 'grid-cols-2 md:grid-cols-3';
   }
-  return 'grid-cols-2 md:grid-cols-4';
+  if (totalTiles <= 16) {
+    return 'grid-cols-2 md:grid-cols-4';
+  }
+  return 'grid-cols-3 md:grid-cols-5';
 }
 
 export function deduplicateTracks(remoteTracks: ParticipantTrack[]): ParticipantTrack[] {
@@ -198,7 +229,8 @@ const VideoTile: React.FC<{
   // (including for the presenter reclaiming their own suspended share:
   // that's a host-only action too, per BR).
   onPromote?: () => void;
-}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove, onMute, isSuspended, onPromote }) => {
+  isActiveSpeaker?: boolean;
+}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove, onMute, isSuspended, onPromote, isActiveSpeaker }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
@@ -221,6 +253,7 @@ const VideoTile: React.FC<{
 
     if (videoRef.current && videoRef.current.srcObject !== stream) {
       videoRef.current.srcObject = stream;
+      videoRef.current.play().catch(() => {});
     }
 
     const handleTrackEvent = () => {
@@ -228,6 +261,7 @@ const VideoTile: React.FC<{
       if (videoRef.current) {
         videoRef.current.srcObject = null;
         videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(() => {});
       }
     };
 
@@ -246,7 +280,12 @@ const VideoTile: React.FC<{
   const { showVideoFallback, showMicMuted } = deriveVisibility(isMicMuted, isCamOff, hasAudio, hasVideo, !!stream, !!isScreen);
 
   return (
-    <div data-testid="video-tile" className="group relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex items-center justify-center w-full h-full">
+    <div
+      data-testid="video-tile"
+      className={`group relative overflow-hidden rounded-2xl bg-slate-900 border ${
+        isActiveSpeaker ? 'border-emerald-500 ring-2 ring-emerald-500 shadow-emerald-500/30' : 'border-slate-800'
+      } shadow-2xl flex items-center justify-center w-full h-full transition-all duration-200`}
+    >
       <video
         ref={videoRef}
         autoPlay
@@ -354,10 +393,23 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   localPeerId,
   activePresentation,
   onSetPresentation,
+  roomPeers,
+  activeSpeakerIds,
 }) => {
   const uniqueTracks = deduplicateTracks(remoteTracks);
   const isEgress = userRole === 'egress';
   const isHost = userRole === 'host';
+
+  // Roster peers who do not have a published track yet (e.g. mic-only or camera-off before streaming)
+  const rosterNoTrackPeers = (roomPeers || []).filter((p) => {
+    if (!p.peer_id) return false;
+    if (localPeerId && p.peer_id === localPeerId) return false;
+    if (p.peer_name?.toLowerCase().includes('egress') || p.peer_id?.toLowerCase().includes('egress')) return false;
+    const hasTrack = uniqueTracks.some(
+      (t) => (t.rawPeerId && t.rawPeerId === p.peer_id) || t.peerID === p.peer_name || t.peerID === p.peer_id
+    );
+    return !hasTrack;
+  });
 
   // BR: multiple simultaneous screen shares are arbitrated server-side
   // (see RoomManager.SetScreenSharing / signaling's set_presentation) —
@@ -451,16 +503,40 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
             // collapse to false, so VideoTile falls back to the track-based
             // heuristic instead of forcing "not muted"/"camera on".
             const state = remoteMediaState?.get(track.peerID);
+            const label = formatParticipantLabel(track.peerID, track.rawPeerId, roomPeers);
+            const isActive = !!(
+              activeSpeakerIds &&
+              ((track.rawPeerId && activeSpeakerIds.has(track.rawPeerId)) || activeSpeakerIds.has(track.peerID))
+            );
             return (
               <div key={track.id} className={sidebarLayout.tile}>
                 <VideoTile
                   stream={track.stream}
-                  label={`User ${track.peerID.slice(0, 6)}`}
+                  label={label}
                   isMicMuted={state ? state.mic === false : undefined}
                   isCamOff={state ? state.cam === false : undefined}
                   isStale={remoteStaleState?.get(track.peerID)}
                   onRemove={removeHandlerFor(track)}
                   onMute={muteHandlerFor(track)}
+                  isActiveSpeaker={isActive}
+                />
+              </div>
+            );
+          })}
+
+          {rosterNoTrackPeers.map((peer) => {
+            const state = remoteMediaState?.get(peer.peer_name || peer.peer_id);
+            const isActive = !!(activeSpeakerIds && activeSpeakerIds.has(peer.peer_id));
+            return (
+              <div key={peer.peer_id} className={sidebarLayout.tile}>
+                <VideoTile
+                  stream={null}
+                  label={peer.peer_name || 'Participant'}
+                  isMicMuted={state ? state.mic === false : true}
+                  isCamOff={true}
+                  onRemove={isHost ? () => onRemoveParticipant?.(peer.peer_id) : undefined}
+                  onMute={isHost ? () => onMuteParticipant?.(peer.peer_id) : undefined}
+                  isActiveSpeaker={isActive}
                 />
               </div>
             );
@@ -470,7 +546,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
     );
   }
 
-  const totalTiles = getTotalTileCount(uniqueTracks.length, isEgress);
+  const totalTiles = getTotalTileCount(uniqueTracks.length + rosterNoTrackPeers.length, isEgress);
   const gridClass = getGridClass(totalTiles);
 
   return (
@@ -479,16 +555,38 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
         {!isEgress && <VideoTile stream={localStream} label={localLabel} />}
         {uniqueTracks.map((track) => {
           const state = remoteMediaState?.get(track.peerID);
+          const label = formatParticipantLabel(track.peerID, track.rawPeerId, roomPeers);
+          const isActive = !!(
+            activeSpeakerIds &&
+            ((track.rawPeerId && activeSpeakerIds.has(track.rawPeerId)) || activeSpeakerIds.has(track.peerID))
+          );
           return (
             <VideoTile
               key={track.id}
               stream={track.stream}
-              label={`User ${track.peerID.slice(0, 6)}`}
+              label={label}
               isMicMuted={state ? state.mic === false : undefined}
               isCamOff={state ? state.cam === false : undefined}
               isStale={remoteStaleState?.get(track.peerID)}
               onRemove={removeHandlerFor(track)}
               onMute={muteHandlerFor(track)}
+              isActiveSpeaker={isActive}
+            />
+          );
+        })}
+        {rosterNoTrackPeers.map((peer) => {
+          const state = remoteMediaState?.get(peer.peer_name || peer.peer_id);
+          const isActive = !!(activeSpeakerIds && activeSpeakerIds.has(peer.peer_id));
+          return (
+            <VideoTile
+              key={peer.peer_id}
+              stream={null}
+              label={peer.peer_name || 'Participant'}
+              isMicMuted={state ? state.mic === false : true}
+              isCamOff={true}
+              onRemove={isHost ? () => onRemoveParticipant?.(peer.peer_id) : undefined}
+              onMute={isHost ? () => onMuteParticipant?.(peer.peer_id) : undefined}
+              isActiveSpeaker={isActive}
             />
           );
         })}

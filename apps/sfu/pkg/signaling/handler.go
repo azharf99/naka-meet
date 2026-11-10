@@ -55,6 +55,10 @@ func (sc *SafeConn) Close() error {
 	return sc.conn.Close()
 }
 
+type RedisPublisher interface {
+	Publish(ctx context.Context, channel string, message interface{}) error
+}
+
 type Handler struct {
 	rm          *room.RoomManager
 	router      *webrtc.SFURouter
@@ -62,6 +66,7 @@ type Handler struct {
 	upgrader    websocket.Upgrader
 	conns       map[string]map[string]*SafeConn
 	connsByUser map[string]*SafeConn
+	publisher   RedisPublisher
 	mu          sync.RWMutex
 
 	// WebSocket liveness-detection intervals, per-Handler (not package
@@ -114,6 +119,30 @@ func NewHandler(rm *room.RoomManager, router *webrtc.SFURouter, jwtSecret []byte
 	return h
 }
 
+func (h *Handler) SetRedisPublisher(pub RedisPublisher) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.publisher = pub
+}
+
+func (h *Handler) notifyRoomActivity(roomSlug string, active bool) {
+	h.mu.RLock()
+	pub := h.publisher
+	h.mu.RUnlock()
+	if pub == nil {
+		return
+	}
+	action := "ROOM_EMPTY"
+	if active {
+		action = "ROOM_ACTIVE"
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"action": action,
+		"room":   roomSlug,
+	})
+	_ = pub.Publish(context.Background(), "channel:egress_commands", string(payload))
+}
+
 // SetAllowedOrigins configures the WS-upgrade/CORS origin allowlist
 // (typically derived from FRONTEND_URL). Without this, any website could
 // open a signaling WebSocket using a victim's browser session cookie
@@ -162,26 +191,38 @@ func (h *Handler) SetLivenessThresholdsForTesting(staleAfter, autoRemoveAfterSta
 	h.rtpAutoRemoveAfterStale = autoRemoveAfterStale
 }
 
-func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) {
+func (h *Handler) registerConn(roomSlug, userID string, conn *SafeConn) *SafeConn {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	var oldConn *SafeConn
+	if roomConns, exists := h.conns[roomSlug]; exists {
+		oldConn = roomConns[userID]
+	}
 	if _, exists := h.conns[roomSlug]; !exists {
 		h.conns[roomSlug] = make(map[string]*SafeConn)
 	}
 	h.conns[roomSlug][userID] = conn
 	h.connsByUser[userID] = conn
+	return oldConn
 }
 
-func (h *Handler) unregisterConn(roomSlug, userID string) {
+func (h *Handler) unregisterConn(roomSlug, userID string, conn *SafeConn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if roomConns, exists := h.conns[roomSlug]; exists {
-		delete(roomConns, userID)
-		if len(roomConns) == 0 {
-			delete(h.conns, roomSlug)
+		if roomConns[userID] == conn {
+			delete(roomConns, userID)
+			if len(roomConns) == 0 {
+				delete(h.conns, roomSlug)
+			}
+		} else {
+			return false
 		}
 	}
-	delete(h.connsByUser, userID)
+	if h.connsByUser[userID] == conn {
+		delete(h.connsByUser, userID)
+	}
+	return true
 }
 
 func (h *Handler) sendOfferToPeer(peerID, sdp string) {
@@ -383,6 +424,10 @@ func (h *Handler) AddTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publ
 	h.router.BroadcastTrackAndRenegotiateWithMetadata(roomSlug, publisherID, publisherName, kind, track, h.sendOfferToPeer)
 }
 
+func (h *Handler) AddTrackAndRenegotiateWithFullMetadata(roomSlug, publisherID, publisherName, kind string, track pion.TrackLocal, ssrc pion.SSRC, isVideo bool) {
+	h.router.BroadcastTrackAndRenegotiateWithFullMetadata(roomSlug, publisherID, publisherName, kind, track, ssrc, isVideo, h.sendOfferToPeer)
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// CORS for cross-origin frontend, restricted to the configured allowlist
 	// (SetAllowedOrigins) — a blind Origin reflection combined with
@@ -400,16 +445,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Extract Token from Cookie, Query Param, or Authorization Header
+	// 1. Extract Token from Query Param, Authorization Header, or Cookie.
+	// Explicit credentials (query param or Authorization header) MUST take precedence
+	// over ambient cookies; otherwise, opening multiple tabs in the same browser
+	// (e.g. host in tab 1, guest in tab 2) causes the guest tab to ambiently send
+	// the host's cookie and hijack/disconnect the host's session.
 	var tokenStr string
-	if cookie, err := r.Cookie("jwt_token"); err == nil && cookie.Value != "" {
-		tokenStr = cookie.Value
-	} else if qToken := r.URL.Query().Get("token"); qToken != "" {
+	if qToken := r.URL.Query().Get("token"); qToken != "" {
 		tokenStr = qToken
 	} else if qJwt := r.URL.Query().Get("jwt_token"); qJwt != "" {
 		tokenStr = qJwt
 	} else if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 		tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+	} else if cookie, err := r.Cookie("jwt_token"); err == nil && cookie.Value != "" {
+		tokenStr = cookie.Value
 	}
 
 	if tokenStr == "" {
@@ -486,6 +535,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.rm.HandleDisconnect(roomSlug, claims.UserID, 15*time.Second)
 
+	oldConn := h.registerConn(roomSlug, claims.UserID, safeConn)
+	if oldConn != nil && oldConn != safeConn {
+		_ = oldConn.Close()
+		_ = h.router.RemovePeer(claims.UserID)
+	}
+
 	// 4. Create PeerConnection in Pion Router
 	pc, err := h.router.AddPeer(claims.UserID)
 	if err != nil {
@@ -502,9 +557,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// called instead once this peer's own offer/answer exchange is durably
 	// complete (see the "offer" case below).
 
-	h.registerConn(roomSlug, claims.UserID, safeConn)
 	defer func() {
-		h.unregisterConn(roomSlug, claims.UserID)
+		if !h.unregisterConn(roomSlug, claims.UserID, safeConn) {
+			return
+		}
 		_ = h.router.RemovePeer(claims.UserID)
 		// If this peer was presenting (active or suspended), clear them out
 		// of the room's screen-share state too — covers every disconnect
@@ -520,7 +576,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"peer_id": claims.UserID,
 		})
 		h.broadcastToRoom(roomSlug, claims.UserID, leftMsg)
+
+		if !p.IsEgress {
+			peers := h.rm.GetParticipants(roomSlug)
+			nonEgressCount := 0
+			for _, peer := range peers {
+				if !peer.IsEgress && peer.ID != claims.UserID {
+					nonEgressCount++
+				}
+			}
+			if nonEgressCount == 0 {
+				h.notifyRoomActivity(roomSlug, false)
+			}
+		}
 	}()
+
+	if !p.IsEgress {
+		h.notifyRoomActivity(roomSlug, true)
+	}
 
 	// Attach ICE Candidate Listener on backend PeerConnection
 	pc.OnICECandidate(func(c *pion.ICECandidate) {
@@ -537,6 +610,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Attach OnTrack Listener on backend PeerConnection for RTP track forwarding
 	pc.OnTrack(func(remoteTrack *pion.TrackRemote, receiver *pion.RTPReceiver) {
+		if claims.Role == "egress" {
+			log.Printf("Ignoring published track from egress client: %s (%s)", claims.UserID, remoteTrack.ID())
+			return
+		}
+
 		localTrack, err := pion.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, remoteTrack.ID(), remoteTrack.StreamID())
 		if err != nil {
 			log.Printf("Failed to create local track: %v", err)
@@ -544,6 +622,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		kind := "camera"
+		isVideo := remoteTrack.Kind() == pion.RTPCodecTypeVideo
 		if strings.Contains(strings.ToLower(remoteTrack.StreamID()), "screen") || strings.Contains(strings.ToLower(remoteTrack.ID()), "screen") {
 			kind = "screen"
 		}
@@ -589,7 +668,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.broadcastToRoom(roomSlug, claims.UserID, metaBytes)
 
 		// Broadcast track to all other room participants & trigger SDP renegotiation
-		h.AddTrackAndRenegotiateWithMetadata(roomSlug, claims.UserID, displayName, kind, localTrack)
+		h.AddTrackAndRenegotiateWithFullMetadata(roomSlug, claims.UserID, displayName, kind, localTrack, remoteTrack.SSRC(), isVideo)
 	})
 
 	// 5. Message Loop
@@ -765,6 +844,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"time":    time.Now().Format("15:04"),
 			})
 			h.broadcastToRoom(roomSlug, claims.UserID, chatBytes)
+
+		case "get_peers":
+			peersList := h.rm.GetParticipants(roomSlug)
+			var peerInfos []map[string]interface{}
+			for _, peer := range peersList {
+				if !peer.IsEgress {
+					peerInfos = append(peerInfos, map[string]interface{}{
+						"peer_id":   peer.ID,
+						"peer_name": peer.Name,
+					})
+				}
+			}
+			rosterBytes, _ := json.Marshal(map[string]interface{}{
+				"type":  "room_peers",
+				"peers": peerInfos,
+			})
+			_ = safeConn.WriteMessage(websocket.TextMessage, rosterBytes)
 		}
 	}
 }

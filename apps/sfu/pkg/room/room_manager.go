@@ -237,6 +237,25 @@ func (rm *RoomManager) GetParticipant(slug string, participantID string) (*Parti
 	return p, found
 }
 
+func (rm *RoomManager) GetParticipants(slug string) []*Participant {
+	rm.rooms.RLock()
+	r, exists := rm.rooms.m[slug]
+	rm.rooms.RUnlock()
+
+	if !exists {
+		return nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var res []*Participant
+	for _, p := range r.Participants {
+		res = append(res, p)
+	}
+	return res
+}
+
 func (rm *RoomManager) GetParticipantCount(slug string) int {
 	rm.rooms.RLock()
 	r, exists := rm.rooms.m[slug]

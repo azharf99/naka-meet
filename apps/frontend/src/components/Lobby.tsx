@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, ArrowRight, AlertCircle, UserPlus, LogOut } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, ArrowRight, AlertCircle, UserPlus, LogOut, Mic, MicOff, Video, VideoOff } from 'lucide-react';
 import { login, signup, createRoom, logout, SessionResponse } from '../services/auth';
 
 export function validateJoinInput(name: string, roomSlug: string): { valid: boolean; error?: string } {
@@ -14,11 +14,16 @@ export function shouldAutoJoinEgress(role: string, roomSlug: string): boolean {
 
 export type HostSession = Pick<SessionResponse, 'token' | 'name' | 'role' | 'user_id'>;
 
+export interface JoinMediaOptions {
+  micOn: boolean;
+  camOn: boolean;
+}
+
 interface LobbyProps {
   initialRoomSlug?: string;
   initialHostSession?: HostSession | null;
-  onJoinRoom: (name: string, roomSlug: string, role: string) => void;
-  onEnterAsHost: (session: HostSession, roomSlug: string) => void;
+  onJoinRoom: (name: string, roomSlug: string, role: string, options?: JoinMediaOptions) => void;
+  onEnterAsHost: (session: HostSession, roomSlug: string, options?: JoinMediaOptions) => void;
 }
 
 
@@ -26,6 +31,8 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
   const [guestName, setGuestName] = useState('');
   const [guestRoomSlug, setGuestRoomSlug] = useState(initialRoomSlug || 'demo-room');
   const [guestError, setGuestError] = useState('');
+  const [micOn, setMicOn] = useState(true);
+  const [camOn, setCamOn] = useState(true);
 
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
   const [hostSession, setHostSession] = useState<HostSession | null>(initialHostSession);
@@ -36,6 +43,12 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
   const [hostError, setHostError] = useState('');
   const [hostBusy, setHostBusy] = useState(false);
 
+  useEffect(() => {
+    if (initialHostSession) {
+      setHostSession(initialHostSession);
+    }
+  }, [initialHostSession]);
+
   const handleGuestJoin = (e: React.FormEvent) => {
     e.preventDefault();
     const validation = validateJoinInput(guestName, guestRoomSlug);
@@ -44,7 +57,7 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
       return;
     }
     setGuestError('');
-    onJoinRoom(guestName.trim(), guestRoomSlug.trim(), 'guest');
+    onJoinRoom(guestName.trim(), guestRoomSlug.trim(), 'guest', { micOn, camOn });
   };
 
   const handleHostAuth = async (e: React.FormEvent) => {
@@ -71,7 +84,7 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
     setHostBusy(true);
     try {
       const roomData = await createRoom(hostRoomSlug.trim(), hostSession.token);
-      onEnterAsHost(hostSession, roomData.room.slug);
+      onEnterAsHost(hostSession, roomData.room.slug, { micOn, camOn });
     } catch (err) {
       setHostError(err instanceof Error ? err.message : 'Failed to create room');
       setHostBusy(false);
@@ -158,6 +171,35 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
                   className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-cyan-500 font-mono transition-colors"
                 />
               </div>
+
+              {/* Pre-join Audio & Video Settings */}
+              <div className="flex items-center gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setMicOn(!micOn)}
+                  className={`flex-1 py-2.5 px-3 rounded-xl border text-xs font-medium flex items-center justify-center gap-2 transition-all ${
+                    micOn
+                      ? 'bg-slate-900/90 border-slate-700/80 text-slate-200'
+                      : 'bg-red-500/10 border-red-500/30 text-red-400'
+                  }`}
+                >
+                  {micOn ? <Mic className="w-3.5 h-3.5 text-emerald-400" /> : <MicOff className="w-3.5 h-3.5" />}
+                  <span>{micOn ? 'Mic Ready' : 'Mic Muted'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCamOn(!camOn)}
+                  className={`flex-1 py-2.5 px-3 rounded-xl border text-xs font-medium flex items-center justify-center gap-2 transition-all ${
+                    camOn
+                      ? 'bg-slate-900/90 border-slate-700/80 text-slate-200'
+                      : 'bg-red-500/10 border-red-500/30 text-red-400'
+                  }`}
+                >
+                  {camOn ? <Video className="w-3.5 h-3.5 text-emerald-400" /> : <VideoOff className="w-3.5 h-3.5" />}
+                  <span>{camOn ? 'Cam Ready' : 'Cam Off'}</span>
+                </button>
+              </div>
+
               <button
                 type="submit"
                 className="w-full mt-2 py-3.5 px-6 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-xl font-semibold text-xs transition-all duration-200 shadow-lg shadow-cyan-600/20 flex items-center justify-center gap-2 group-hover:scale-[1.01]"
@@ -212,6 +254,35 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
                     className="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 font-mono transition-colors"
                   />
                 </div>
+
+                {/* Pre-join Audio & Video Settings for Host */}
+                <div className="flex items-center gap-3 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setMicOn(!micOn)}
+                    className={`flex-1 py-2.5 px-3 rounded-xl border text-xs font-medium flex items-center justify-center gap-2 transition-all ${
+                      micOn
+                        ? 'bg-slate-900/90 border-slate-700/80 text-slate-200'
+                        : 'bg-red-500/10 border-red-500/30 text-red-400'
+                    }`}
+                  >
+                    {micOn ? <Mic className="w-3.5 h-3.5 text-emerald-400" /> : <MicOff className="w-3.5 h-3.5" />}
+                    <span>{micOn ? 'Mic Ready' : 'Mic Muted'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCamOn(!camOn)}
+                    className={`flex-1 py-2.5 px-3 rounded-xl border text-xs font-medium flex items-center justify-center gap-2 transition-all ${
+                      camOn
+                        ? 'bg-slate-900/90 border-slate-700/80 text-slate-200'
+                        : 'bg-red-500/10 border-red-500/30 text-red-400'
+                    }`}
+                  >
+                    {camOn ? <Video className="w-3.5 h-3.5 text-emerald-400" /> : <VideoOff className="w-3.5 h-3.5" />}
+                    <span>{camOn ? 'Cam Ready' : 'Cam Off'}</span>
+                  </button>
+                </div>
+
                 <button
                   type="submit"
                   disabled={hostBusy}

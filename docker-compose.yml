@@ -30,6 +30,9 @@ services:
       retries: 5
 
   sfu-backend:
+    build:
+      context: ./apps/sfu
+      dockerfile: Dockerfile
     image: azharfa/naka-meet-sfu:latest
     container_name: naka-sfu
     ports:
@@ -37,6 +40,10 @@ services:
       - "50000-50050:50000-50050/udp"
     env_file:
       - .env
+    environment:
+      - RECORDINGS_DIR=/usr/src/app/recordings
+    volumes:
+      - ./recordings:/usr/src/app/recordings
     depends_on:
       redis:
         condition: service_healthy
@@ -59,6 +66,9 @@ services:
           memory: 2G
 
   frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile
     image: azharfa/naka-meet-frontend:latest
     container_name: naka-frontend
     ports:
@@ -69,6 +79,9 @@ services:
       - naka_network
 
   egress-worker:
+    build:
+      context: ./apps/egress
+      dockerfile: Dockerfile
     image: azharfa/naka-meet-egress:latest
     container_name: naka-egress
     env_file:

@@ -8,6 +8,17 @@ import { getIceServers } from './auth';
 // immediately.
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
+export interface MediaAcquireOptions {
+  mic?: boolean;
+  cam?: boolean;
+}
+
+export interface ConnectOptions {
+  isEgress?: boolean;
+  initialMicOn?: boolean;
+  initialCamOn?: boolean;
+}
+
 // acquireLocalMedia requests camera and microphone as two independent
 // getUserMedia calls instead of one combined {video, audio} request. A
 // single combined call fails BOTH devices if either one is busy/denied
@@ -16,17 +27,51 @@ const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19
 // instead of just going camera-off or mic-off for the one device that
 // actually failed. Each failure is caught independently so one busy
 // device degrades only itself.
-async function acquireLocalMedia(): Promise<MediaStream | null> {
-  const [videoResult, audioResult] = await Promise.all([
-    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } }).catch((err) => {
-      console.warn('Could not access camera, proceeding without video', err);
-      return null;
-    }),
-    navigator.mediaDevices.getUserMedia({ audio: true }).catch((err) => {
-      console.warn('Could not access microphone, proceeding without audio', err);
-      return null;
-    }),
-  ]);
+async function acquireLocalMedia(options?: MediaAcquireOptions): Promise<MediaStream | null> {
+  if (
+    typeof navigator === 'undefined' ||
+    !navigator.mediaDevices ||
+    typeof navigator.mediaDevices.getUserMedia !== 'function'
+  ) {
+    return null;
+  }
+  if (options?.cam === false && options?.mic === false) {
+    return null;
+  }
+
+  const videoPromise =
+    options?.cam === false
+      ? Promise.resolve(null)
+      : navigator.mediaDevices
+          .getUserMedia({
+            video: {
+              width: { ideal: 640, max: 1280 },
+              height: { ideal: 480, max: 720 },
+              frameRate: { ideal: 24, max: 30 },
+            },
+          })
+          .catch((err) => {
+            console.warn('Could not access camera, proceeding without video', err);
+            return null;
+          });
+
+  const audioPromise =
+    options?.mic === false
+      ? Promise.resolve(null)
+      : navigator.mediaDevices
+          .getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          })
+          .catch((err) => {
+            console.warn('Could not access microphone, proceeding without audio', err);
+            return null;
+          });
+
+  const [videoResult, audioResult] = await Promise.all([videoPromise, audioPromise]);
 
   const tracks = [...(videoResult?.getTracks() ?? []), ...(audioResult?.getTracks() ?? [])];
   return tracks.length > 0 ? new MediaStream(tracks) : null;
@@ -57,6 +102,7 @@ export class WebRTCService {
   private ws: WebSocket | null = null;
   private localStream: MediaStream | null = null;
   private screenStream: MediaStream | null = null;
+  private rosterInterval: ReturnType<typeof setInterval> | null = null;
 
   private makingOffer = false;
   private messageQueue: Promise<void> = Promise.resolve();
@@ -80,6 +126,8 @@ export class WebRTCService {
   public onMessageReceived?: MessageCallback;
   public onMediaStateChanged?: MediaStateCallback;
   public onRecordingStateChanged?: RecordingStateCallback;
+  public onRoomPeers?: (peers: Array<{ peer_id: string; peer_name: string }>) => void;
+  public onTrackMetadataUpdated?: (metadata: { track_id?: string; stream_id?: string; peer_id?: string; peer_name?: string; kind?: string }) => void;
   // Fired when the server's RTP-liveness watchdog flags a publisher's track
   // as having gone silent (stale: true) or having recovered (stale: false)
   // — lets the grid show a "reconnecting" state instead of a permanently
@@ -115,27 +163,32 @@ export class WebRTCService {
   constructor(private roomSlug: string) {}
 
 
-  public async connectToken(token: string): Promise<void> {
-    // 1. Get Local Media (Camera + Mic) and this deployment's ICE server
-    // list (STUN, plus TURN if the operator has configured coturn — see
-    // .env.example) in parallel — independent I/O with nothing to
-    // serialize. STUN alone silently strands any participant whose network
-    // needs a relay (symmetric NAT, most mobile carriers, restrictive
-    // corporate firewalls) — invisible on a single LAN, which is exactly
-    // why that class of failure is easy to ship without noticing.
-    const [mediaResult, iceServers] = await Promise.all([
-      acquireLocalMedia(),
-      getIceServers(token)
-        .then((res) => (res.iceServers.length > 0 ? res.iceServers : FALLBACK_ICE_SERVERS))
-        .catch((err) => {
-          console.warn('Could not fetch ICE server config, falling back to public STUN only', err);
-          return FALLBACK_ICE_SERVERS;
-        }),
-    ]);
-    this.localStream = mediaResult;
+  public async connectToken(token: string, options?: ConnectOptions): Promise<void> {
+    const isEgress = !!options?.isEgress;
+    const fetchIceServers = getIceServers(token)
+      .then((res) => (res.iceServers.length > 0 ? res.iceServers : FALLBACK_ICE_SERVERS))
+      .catch((err) => {
+        console.warn('Could not fetch ICE server config, falling back to public STUN only', err);
+        return FALLBACK_ICE_SERVERS;
+      });
 
-    // 2. Setup RTCPeerConnection
-    this.pc = new RTCPeerConnection({ iceServers });
+    if (isEgress) {
+      // Egress recorder is pure receive-only: never access camera/mic inside container
+      const iceServers = await fetchIceServers;
+      this.localStream = null;
+      this.pc = new RTCPeerConnection({ iceServers });
+    } else {
+      // 1. Get Local Media (Camera + Mic) and this deployment's ICE server list in parallel
+      const [mediaResult, iceServers] = await Promise.all([
+        acquireLocalMedia({
+          mic: options?.initialMicOn !== false,
+          cam: options?.initialCamOn !== false,
+        }),
+        fetchIceServers,
+      ]);
+      this.localStream = mediaResult;
+      this.pc = new RTCPeerConnection({ iceServers });
+    }
 
     // Handle Trickle ICE Candidates
     this.pc.onicecandidate = (event) => {
@@ -166,19 +219,58 @@ export class WebRTCService {
       }
     };
 
-    // Add local tracks to PeerConnection
-    if (this.localStream && this.localStream.getTracks().length > 0) {
-      this.localStream.getTracks().forEach((track) => {
-        if (this.pc && this.localStream) {
-          this.pc.addTrack(track, this.localStream);
+    // Add local tracks to PeerConnection or setup recvonly transceivers
+    if (isEgress) {
+      if (this.pc && typeof this.pc.addTransceiver === 'function') {
+        try {
+          this.pc.addTransceiver('video', { direction: 'recvonly' });
+          this.pc.addTransceiver('audio', { direction: 'recvonly' });
+        } catch (e) {
+          console.warn('Could not add recvonly transceivers for egress', e);
         }
-      });
-    } else if (this.pc && typeof this.pc.addTransceiver === 'function') {
-      try {
-        this.pc.addTransceiver('video', { direction: 'recvonly' });
-        this.pc.addTransceiver('audio', { direction: 'recvonly' });
-      } catch (e) {
-        console.warn('Could not add recvonly transceivers', e);
+      }
+    } else {
+      let hasVideo = false;
+      let hasAudio = false;
+
+      if (this.localStream && this.localStream.getTracks().length > 0) {
+        this.localStream.getTracks().forEach((track) => {
+          if (this.pc && this.localStream) {
+            this.pc.addTrack(track, this.localStream);
+            if (track.kind === 'video') {
+              hasVideo = true;
+              try {
+                const senders = typeof this.pc.getSenders === 'function' ? this.pc.getSenders() : [];
+                const sender = senders.find((s) => s.track === track);
+                if (sender && typeof sender.getParameters === 'function' && typeof sender.setParameters === 'function') {
+                  const params = sender.getParameters();
+                  if (params && params.encodings && params.encodings.length > 0) {
+                    params.encodings[0].maxBitrate = 500_000;
+                    sender.setParameters(params).catch(() => {});
+                  }
+                }
+              } catch (e) {
+                // Ignore bitrate cap failure on mocks or unsupported browsers
+              }
+            } else if (track.kind === 'audio') {
+              hasAudio = true;
+            }
+          }
+        });
+      }
+
+      // Add recvonly transceivers for missing media so we can receive remote tracks cleanly
+      if (this.pc && typeof this.pc.addTransceiver === 'function') {
+        try {
+          if (!hasVideo) {
+            this.pc.addTransceiver('video', { direction: 'recvonly' });
+          }
+          if (!hasAudio) {
+            this.pc.addTransceiver('audio', { direction: 'recvonly' });
+          }
+        } catch (e) {
+          console.warn('Could not add recvonly transceivers', e);
+        }
       }
     }
 
@@ -260,6 +352,14 @@ export class WebRTCService {
             await this.pc.setLocalDescription(offer);
             this.ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
           }
+          // Fetch current roster of participants
+          this.ws.send(JSON.stringify({ type: 'get_peers' }));
+          if (this.rosterInterval) clearInterval(this.rosterInterval);
+          this.rosterInterval = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+              this.ws.send(JSON.stringify({ type: 'get_peers' }));
+            }
+          }, 2500);
         }
       } catch (err) {
         console.error('Error sending initial SDP offer on WS open:', err);
@@ -269,6 +369,10 @@ export class WebRTCService {
     };
 
     this.ws.onclose = () => {
+      if (this.rosterInterval) {
+        clearInterval(this.rosterInterval);
+        this.rosterInterval = null;
+      }
       // The server sends "removed" then closes the socket itself — that
       // close shouldn't also trigger the generic "Connection lost" banner,
       // which would misleadingly suggest reloading might fix it.
@@ -281,6 +385,20 @@ export class WebRTCService {
 
     this.ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
+      if (msg.type === 'room_peers') {
+        if (Array.isArray(msg.peers)) {
+          msg.peers.forEach((peer: { peer_id: string; peer_name: string }) => {
+            if (peer.peer_id && peer.peer_name) {
+              this.registerPeerIdentifier(peer.peer_id, peer.peer_name);
+            }
+          });
+          if (this.onRoomPeers) {
+            this.onRoomPeers(msg.peers);
+          }
+        }
+        return;
+      }
+
       if (msg.type === 'track_metadata') {
         if (msg.stream_id && msg.kind) {
           streamMetadataMap.set(msg.stream_id, msg.kind);
@@ -303,6 +421,9 @@ export class WebRTCService {
         }
         if (msg.kind === 'screen_stopped' && msg.stream_id && this.onTrackRemoved) {
           this.onTrackRemoved(msg.stream_id);
+        }
+        if (this.onTrackMetadataUpdated) {
+          this.onTrackMetadataUpdated(msg);
         }
         return;
       }
@@ -534,6 +655,10 @@ export class WebRTCService {
   }
 
   public disconnect(): void {
+    if (this.rosterInterval) {
+      clearInterval(this.rosterInterval);
+      this.rosterInterval = null;
+    }
     this.localStream?.getTracks().forEach((t) => t.stop());
     this.screenStream?.getTracks().forEach((t) => t.stop());
     this.pc?.close();

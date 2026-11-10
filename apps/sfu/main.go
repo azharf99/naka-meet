@@ -87,7 +87,7 @@ func main() {
 	}
 
 	// 1. SFU Router (Pion WebRTC v4)
-	router, err := webrtc.NewSFURouter(uint16(udpMin), uint16(udpMax))
+	router, err := webrtc.NewSFURouter(uint16(udpMin), uint16(udpMax), os.Getenv("WEBRTC_NAT_1TO1_IPS"))
 	if err != nil {
 		log.Fatalf("Failed to initialize SFU Router: %v", err)
 	}
@@ -96,12 +96,15 @@ func main() {
 	rm := room.NewRoomManager(rdb)
 
 	// 3. Handlers
+	redisPub := &RedisPubWrapper{rdb: rdb}
 	signalingHandler := signaling.NewHandler(rm, router, jwtSecret)
 	signalingHandler.SetAllowedOrigins(allowedOrigins)
+	signalingHandler.SetRedisPublisher(redisPub)
 
-	apiHandler := api.NewAPIHandlerWithDeps(jwtSecret, &RedisPubWrapper{rdb: rdb}, rm, gormDB)
+	apiHandler := api.NewAPIHandlerWithDeps(jwtSecret, redisPub, rm, gormDB)
 	apiHandler.SetAllowedOrigins(allowedOrigins)
 	apiHandler.SetSecureCookies(secureCookies)
+	apiHandler.SetRecordingsDir(os.Getenv("RECORDINGS_DIR"))
 	// So every participant (not just the host whose click triggered it) is
 	// notified when a recording/RTMP stream starts or stops.
 	apiHandler.SetRecordingBroadcaster(signalingHandler.BroadcastRecordingState)

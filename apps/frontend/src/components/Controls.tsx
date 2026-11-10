@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Mic, MicOff, Video, VideoOff, Monitor, MessageSquare, Radio, CircleDot, PhoneOff, X } from 'lucide-react';
+import { Mic, MicOff, Video, VideoOff, Monitor, MessageSquare, Radio, CircleDot, PhoneOff, X, FolderDown } from 'lucide-react';
 
 export function validateRtmpUrl(url: string): boolean {
   if (!url) return false;
@@ -16,14 +16,19 @@ interface ControlsProps {
   // unmuted in between) still re-triggers the sync below — a boolean
   // that's already `true` wouldn't change on a repeat event.
   forceMuteSignal?: number;
+  initialMicOn?: boolean;
+  initialCamOn?: boolean;
   onToggleMic: () => void;
   onToggleCam: () => void;
   onScreenShare: () => void;
   onStopScreenShare?: () => void;
   onToggleChat: () => void;
   onStartRecording: () => void;
+  onStopRecording?: () => void;
   onStartRTMP: (url: string) => void;
+  onStopRTMP?: () => void;
   onStopEgress: () => void;
+  onOpenRecordings?: () => void;
   onLeave: () => void;
 }
 
@@ -33,18 +38,23 @@ export const Controls: React.FC<ControlsProps> = ({
   isLiveStreaming = false,
   isScreenSharing = false,
   forceMuteSignal,
+  initialMicOn = true,
+  initialCamOn = true,
   onToggleMic,
   onToggleCam,
   onScreenShare,
   onStopScreenShare,
   onToggleChat,
   onStartRecording,
+  onStopRecording,
   onStartRTMP,
+  onStopRTMP,
   onStopEgress,
+  onOpenRecordings,
   onLeave,
 }) => {
-  const [micOn, setMicOn] = useState(true);
-  const [camOn, setCamOn] = useState(true);
+  const [micOn, setMicOn] = useState(initialMicOn);
+  const [camOn, setCamOn] = useState(initialCamOn);
   const [showRtmpModal, setShowRtmpModal] = useState(false);
   const [rtmpUrlInput, setRtmpUrlInput] = useState('');
   const [rtmpError, setRtmpError] = useState('');
@@ -135,27 +145,39 @@ export const Controls: React.FC<ControlsProps> = ({
           <div className="flex items-center gap-2 border-l border-slate-800 pl-3">
             {/* Record Room Button */}
             <button
-              onClick={isRecording ? onStopEgress : onStartRecording}
+              onClick={isRecording ? (onStopRecording || onStopEgress) : onStartRecording}
               className={`px-3 py-2.5 rounded-xl flex items-center gap-2 font-medium text-xs transition-all duration-200 ${
                 isRecording ? 'bg-red-600 text-white animate-pulse' : 'bg-slate-800 hover:bg-slate-700 text-red-400 border border-red-500/20'
               }`}
               title="Record Room to Persistent Storage"
             >
               <CircleDot className="w-4 h-4" />
-              {isRecording ? 'REC Active' : 'Record'}
+              {isRecording ? 'Stop REC' : 'Record'}
             </button>
 
             {/* Live Stream RTMP Button */}
             <button
-              onClick={isLiveStreaming ? onStopEgress : () => setShowRtmpModal(true)}
+              onClick={isLiveStreaming ? (onStopRTMP || onStopEgress) : () => setShowRtmpModal(true)}
               className={`px-3 py-2.5 rounded-xl flex items-center gap-2 font-medium text-xs transition-all duration-200 ${
                 isLiveStreaming ? 'bg-indigo-600 text-white animate-pulse' : 'bg-slate-800 hover:bg-slate-700 text-indigo-400 border border-indigo-500/20'
               }`}
               title="Live Stream to YouTube RTMP"
             >
               <Radio className="w-4 h-4" />
-              {isLiveStreaming ? 'LIVE Stream' : 'Go Live'}
+              {isLiveStreaming ? 'Stop LIVE' : 'Go Live'}
             </button>
+
+            {/* Recording Files Browser */}
+            {onOpenRecordings && (
+              <button
+                onClick={onOpenRecordings}
+                className="px-3 py-2.5 rounded-xl flex items-center gap-2 font-medium text-xs bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/20 transition-all duration-200"
+                title="View Recorded Meeting Files"
+              >
+                <FolderDown className="w-4 h-4" />
+                <span>Files</span>
+              </button>
+            )}
           </div>
         )}
 

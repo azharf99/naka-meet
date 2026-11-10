@@ -66,7 +66,7 @@ export const App: React.FC = () => {
   const [isLiveStreaming, setIsLiveStreaming] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [showRecordingsModal, setShowRecordingsModal] = useState(false);
-  const [recordingsList, setRecordingsList] = useState<Array<{ filename: string; size: number; mod_time: string }>>([]);
+  const [recordingsList, setRecordingsList] = useState<Array<{ filename: string; size: number; created_at?: string; mod_time?: string }>>([]);
   const [loadingRecordings, setLoadingRecordings] = useState(false);
 
   const [restoredHostSession, setRestoredHostSession] = useState<HostSession | null>(null);
@@ -330,7 +330,7 @@ export const App: React.FC = () => {
     return () => {
       activeService?.disconnect();
     };
-  }, [inMeeting, token, roomSlug, initialMicOn, initialCamOn]);
+  }, [inMeeting, token, roomSlug, userRole, initialMicOn, initialCamOn]);
 
   // Signals the egress worker (apps/egress/worker.js's waitForEgressReady)
   // that it's safe to start FFmpeg: either a real remote track has already
@@ -731,7 +731,7 @@ export const App: React.FC = () => {
                     <div className="truncate mr-3">
                       <p className="font-medium text-slate-200 truncate">{rec.filename}</p>
                       <p className="text-[11px] text-slate-400">
-                        {(rec.size / (1024 * 1024)).toFixed(2)} MB • {new Date(rec.created_at || rec.mod_time || Date.now()).toLocaleString()}
+                        {(rec.size / (1024 * 1024)).toFixed(2)} MB • {rec.created_at || rec.mod_time ? new Date(rec.created_at || rec.mod_time || '').toLocaleString() : 'Recent'}
                       </p>
                     </div>
                     <a

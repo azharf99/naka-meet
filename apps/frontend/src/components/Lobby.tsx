@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, ArrowRight, AlertCircle, UserPlus, LogOut, Mic, MicOff, Video, VideoOff } from 'lucide-react';
 import { login, signup, createRoom, logout, SessionResponse } from '../services/auth';
 
@@ -36,6 +36,7 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
 
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
   const [hostSession, setHostSession] = useState<HostSession | null>(initialHostSession);
+  const [prevInitialSession, setPrevInitialSession] = useState<HostSession | null>(initialHostSession);
   const [hostName, setHostName] = useState('');
   const [hostEmail, setHostEmail] = useState('');
   const [hostPassword, setHostPassword] = useState('');
@@ -43,11 +44,10 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
   const [hostError, setHostError] = useState('');
   const [hostBusy, setHostBusy] = useState(false);
 
-  useEffect(() => {
-    if (initialHostSession) {
-      setHostSession(initialHostSession);
-    }
-  }, [initialHostSession]);
+  if (initialHostSession !== prevInitialSession) {
+    setPrevInitialSession(initialHostSession);
+    setHostSession(initialHostSession);
+  }
 
   const handleGuestJoin = (e: React.FormEvent) => {
     e.preventDefault();

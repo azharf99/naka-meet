@@ -249,7 +249,7 @@ export class WebRTCService {
                     sender.setParameters(params).catch(() => {});
                   }
                 }
-              } catch (e) {
+              } catch {
                 // Ignore bitrate cap failure on mocks or unsupported browsers
               }
             } else if (track.kind === 'audio') {

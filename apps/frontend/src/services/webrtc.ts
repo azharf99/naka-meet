@@ -11,12 +11,16 @@ const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19
 export interface MediaAcquireOptions {
   mic?: boolean;
   cam?: boolean;
+  audioDeviceId?: string;
+  videoDeviceId?: string;
 }
 
 export interface ConnectOptions {
   isEgress?: boolean;
   initialMicOn?: boolean;
   initialCamOn?: boolean;
+  audioDeviceId?: string;
+  videoDeviceId?: string;
 }
 
 // acquireLocalMedia requests camera and microphone as two independent
@@ -39,32 +43,42 @@ async function acquireLocalMedia(options?: MediaAcquireOptions): Promise<MediaSt
     return null;
   }
 
+  const videoConstraints: MediaTrackConstraints = {
+    width: { ideal: 640, max: 1280 },
+    height: { ideal: 480, max: 720 },
+    frameRate: { ideal: 24, max: 30 },
+  };
+  if (options?.videoDeviceId) {
+    videoConstraints.deviceId = { ideal: options.videoDeviceId };
+  }
+
   const videoPromise =
     options?.cam === false
       ? Promise.resolve(null)
       : navigator.mediaDevices
           .getUserMedia({
-            video: {
-              width: { ideal: 640, max: 1280 },
-              height: { ideal: 480, max: 720 },
-              frameRate: { ideal: 24, max: 30 },
-            },
+            video: videoConstraints,
           })
           .catch((err) => {
             console.warn('Could not access camera, proceeding without video', err);
             return null;
           });
 
+  const audioConstraints: MediaTrackConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+  if (options?.audioDeviceId) {
+    audioConstraints.deviceId = { ideal: options.audioDeviceId };
+  }
+
   const audioPromise =
     options?.mic === false
       ? Promise.resolve(null)
       : navigator.mediaDevices
           .getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
+            audio: audioConstraints,
           })
           .catch((err) => {
             console.warn('Could not access microphone, proceeding without audio', err);
@@ -183,6 +197,8 @@ export class WebRTCService {
         acquireLocalMedia({
           mic: options?.initialMicOn !== false,
           cam: options?.initialCamOn !== false,
+          audioDeviceId: options?.audioDeviceId,
+          videoDeviceId: options?.videoDeviceId,
         }),
         fetchIceServers,
       ]);
@@ -647,6 +663,120 @@ export class WebRTCService {
         text: trimmed,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       });
+    }
+  }
+
+  public async switchAudioInput(deviceId: string): Promise<MediaStream | null> {
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function'
+    ) {
+      return this.localStream;
+    }
+
+    try {
+      const audioConstraints: MediaTrackConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+      if (deviceId) {
+        audioConstraints.deviceId = { exact: deviceId };
+      }
+
+      const newStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+      const newAudioTrack = newStream.getAudioTracks()[0];
+      if (!newAudioTrack) return this.localStream;
+
+      const oldAudioTracks = this.localStream?.getAudioTracks() || [];
+      const oldTrack = oldAudioTracks[0];
+
+      // Preserve current mute/unmute status
+      if (oldTrack) {
+        newAudioTrack.enabled = oldTrack.enabled;
+      }
+
+      // Hot-swap track on existing RTCRtpSender without renegotiation
+      if (this.pc && typeof this.pc.getSenders === 'function') {
+        const senders = this.pc.getSenders();
+        const audioSender = senders.find((s) => s.track && s.track.kind === 'audio') ||
+                            senders.find((s) => !s.track);
+        if (audioSender && typeof audioSender.replaceTrack === 'function') {
+          await audioSender.replaceTrack(newAudioTrack);
+        } else if (this.localStream) {
+          this.pc.addTrack(newAudioTrack, this.localStream);
+        }
+      }
+
+      // Stop old audio tracks
+      oldAudioTracks.forEach((t) => t.stop());
+
+      // Update localStream
+      const remainingTracks = (this.localStream?.getTracks() || []).filter((t) => t.kind !== 'audio');
+      this.localStream = new MediaStream([...remainingTracks, newAudioTrack]);
+
+      return this.localStream;
+    } catch (err) {
+      console.error('Failed to switch audio input device', err);
+      throw err;
+    }
+  }
+
+  public async switchVideoInput(deviceId: string): Promise<MediaStream | null> {
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function'
+    ) {
+      return this.localStream;
+    }
+
+    try {
+      const videoConstraints: MediaTrackConstraints = {
+        width: { ideal: 640, max: 1280 },
+        height: { ideal: 480, max: 720 },
+        frameRate: { ideal: 24, max: 30 },
+      };
+      if (deviceId) {
+        videoConstraints.deviceId = { exact: deviceId };
+      }
+
+      const newStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints });
+      const newVideoTrack = newStream.getVideoTracks()[0];
+      if (!newVideoTrack) return this.localStream;
+
+      const oldVideoTracks = this.localStream?.getVideoTracks() || [];
+      const oldTrack = oldVideoTracks[0];
+
+      // Preserve current camera on/off status
+      if (oldTrack) {
+        newVideoTrack.enabled = oldTrack.enabled;
+      }
+
+      // Hot-swap track on existing RTCRtpSender without renegotiation
+      if (this.pc && typeof this.pc.getSenders === 'function') {
+        const senders = this.pc.getSenders();
+        const videoSender = senders.find((s) => s.track && s.track.kind === 'video') ||
+                            senders.find((s) => !s.track);
+        if (videoSender && typeof videoSender.replaceTrack === 'function') {
+          await videoSender.replaceTrack(newVideoTrack);
+        } else if (this.localStream) {
+          this.pc.addTrack(newVideoTrack, this.localStream);
+        }
+      }
+
+      // Stop old video tracks
+      oldVideoTracks.forEach((t) => t.stop());
+
+      // Update localStream
+      const remainingTracks = (this.localStream?.getTracks() || []).filter((t) => t.kind !== 'video');
+      this.localStream = new MediaStream([...remainingTracks, newVideoTrack]);
+
+      return this.localStream;
+    } catch (err) {
+      console.error('Failed to switch video input device', err);
+      throw err;
     }
   }
 

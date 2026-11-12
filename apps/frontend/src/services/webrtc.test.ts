@@ -13,6 +13,7 @@ class MockRTCPeerConnection {
   createAnswer = vi.fn().mockResolvedValue({ type: 'answer', sdp: 'mock-sdp' });
   addIceCandidate = vi.fn().mockResolvedValue(undefined);
   close = vi.fn();
+  getSenders = vi.fn().mockReturnValue([]);
 
   // Captured so tests can assert connectToken actually passed through
   // whatever /api/v1/ice-servers returned, rather than always the
@@ -32,15 +33,27 @@ class MockWebSocket {
 }
 
 // Minimal stand-in for the real MediaStream constructor (not available in
-// vitest's node test environment) — just enough surface (getTracks) for
-// acquireLocalMedia's merge-two-independent-getUserMedia-calls logic.
+// vitest's node test environment) — just enough surface (getTracks, getVideoTracks, getAudioTracks)
+// for acquireLocalMedia and device hot-swapping logic.
 class MockMediaStream {
   private tracks: any[];
   constructor(tracks: any[] = []) {
-    this.tracks = tracks;
+    this.tracks = [...tracks];
   }
   getTracks() {
     return this.tracks;
+  }
+  getVideoTracks() {
+    return this.tracks.filter((t) => t.kind === 'video');
+  }
+  getAudioTracks() {
+    return this.tracks.filter((t) => t.kind === 'audio');
+  }
+  addTrack(track: any) {
+    this.tracks.push(track);
+  }
+  removeTrack(track: any) {
+    this.tracks = this.tracks.filter((t) => t !== track);
   }
 }
 
@@ -59,12 +72,14 @@ Object.defineProperty(globalThis, 'navigator', {
       // per-call to prove one failing device doesn't take down the other.
       getUserMedia: vi.fn().mockImplementation((constraints: any) => {
         if (constraints?.video) {
-          return Promise.resolve({ getTracks: () => [{ kind: 'video', id: 'video-track', stop: vi.fn() }] });
+          const track = { kind: 'video', id: 'video-track', enabled: true, stop: vi.fn() };
+          return Promise.resolve(new MockMediaStream([track]));
         }
         if (constraints?.audio) {
-          return Promise.resolve({ getTracks: () => [{ kind: 'audio', id: 'audio-track', stop: vi.fn() }] });
+          const track = { kind: 'audio', id: 'audio-track', enabled: true, stop: vi.fn() };
+          return Promise.resolve(new MockMediaStream([track]));
         }
-        return Promise.resolve({ getTracks: () => [] });
+        return Promise.resolve(new MockMediaStream([]));
       }),
       getDisplayMedia: vi.fn().mockResolvedValue({
         id: 'screen-stream-1',
@@ -458,6 +473,74 @@ describe('WebRTCService Audit & Unit Tests', () => {
     });
 
     expect(received).toEqual({ active: true, kind: 'recording' });
+  });
+
+  test('connectToken forwards audioDeviceId and videoDeviceId to getUserMedia', async () => {
+    const gum = globalThis.navigator.mediaDevices.getUserMedia as any;
+    gum.mockClear();
+
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token', {
+      audioDeviceId: 'custom-mic-id',
+      videoDeviceId: 'custom-cam-id',
+    });
+
+    expect(gum).toHaveBeenCalledWith(
+      expect.objectContaining({
+        video: expect.objectContaining({
+          deviceId: { ideal: 'custom-cam-id' },
+        }),
+      })
+    );
+    expect(gum).toHaveBeenCalledWith(
+      expect.objectContaining({
+        audio: expect.objectContaining({
+          deviceId: { ideal: 'custom-mic-id' },
+        }),
+      })
+    );
+  });
+
+  test('switchAudioInput hot-swaps audio track via replaceTrack without renegotiation', async () => {
+    const mockReplaceTrack = vi.fn().mockResolvedValue(undefined);
+    const audioSender = {
+      track: { kind: 'audio', id: 'old-audio-track' },
+      replaceTrack: mockReplaceTrack,
+    };
+
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const pc = (service as any).pc as MockRTCPeerConnection;
+    pc.getSenders = vi.fn().mockReturnValue([audioSender]);
+
+    const newStream = await service.switchAudioInput('new-mic-device');
+    expect(mockReplaceTrack).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'audio' })
+    );
+    expect(newStream).not.toBeNull();
+    expect(newStream!.getAudioTracks().length).toBe(1);
+  });
+
+  test('switchVideoInput hot-swaps video track via replaceTrack without renegotiation', async () => {
+    const mockReplaceTrack = vi.fn().mockResolvedValue(undefined);
+    const videoSender = {
+      track: { kind: 'video', id: 'old-video-track' },
+      replaceTrack: mockReplaceTrack,
+    };
+
+    const service = new WebRTCService('demo-room');
+    await service.connectToken('mock-jwt-token');
+
+    const pc = (service as any).pc as MockRTCPeerConnection;
+    pc.getSenders = vi.fn().mockReturnValue([videoSender]);
+
+    const newStream = await service.switchVideoInput('new-cam-device');
+    expect(mockReplaceTrack).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'video' })
+    );
+    expect(newStream).not.toBeNull();
+    expect(newStream!.getVideoTracks().length).toBe(1);
   });
 });
 

@@ -39,6 +39,8 @@ interface VideoGridProps {
   roomPeers?: Array<{ peer_id: string; peer_name: string }>;
   // Set of participant rawPeerIds or names currently speaking
   activeSpeakerIds?: Set<string>;
+  // Preferred audio output (speaker) deviceId to route remote audio to
+  audioOutputDeviceId?: string;
 }
 
 export function formatParticipantLabel(
@@ -230,10 +232,22 @@ const VideoTile: React.FC<{
   // that's a host-only action too, per BR).
   onPromote?: () => void;
   isActiveSpeaker?: boolean;
-}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove, onMute, isSuspended, onPromote, isActiveSpeaker }) => {
+  audioOutputDeviceId?: string;
+}> = ({ stream, label, isScreen, isMicMuted, isCamOff, isStale, onRemove, onMute, isSuspended, onPromote, isActiveSpeaker, audioOutputDeviceId }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
+
+  // Apply audio output destination (speaker/headset) via setSinkId if supported
+  useEffect(() => {
+    if (!videoRef.current || !audioOutputDeviceId || label.includes('You')) return;
+    const el = videoRef.current as HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> };
+    if (typeof el.setSinkId === 'function') {
+      el.setSinkId(audioOutputDeviceId).catch((err) => {
+        console.warn(`Failed to setSinkId(${audioOutputDeviceId}) on video tile:`, err);
+      });
+    }
+  }, [audioOutputDeviceId, stream, label]);
 
   useEffect(() => {
     if (!stream) {
@@ -395,6 +409,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
   onSetPresentation,
   roomPeers,
   activeSpeakerIds,
+  audioOutputDeviceId,
 }) => {
   const uniqueTracks = deduplicateTracks(remoteTracks);
   const isEgress = userRole === 'egress';
@@ -465,6 +480,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
             isScreen
             isStale={activeRemoteTrack ? remoteStaleState?.get(activeRemoteTrack.peerID) : undefined}
             onRemove={activeRemoteTrack ? removeHandlerFor(activeRemoteTrack) : undefined}
+            audioOutputDeviceId={activeIsLocal ? undefined : audioOutputDeviceId}
           />
         </div>
         <div className={sidebarLayout.container}>
@@ -494,6 +510,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
                 isScreen
                 isSuspended
                 onPromote={promoteHandlerFor(track.rawPeerId)}
+                audioOutputDeviceId={audioOutputDeviceId}
               />
             </div>
           ))}
@@ -519,6 +536,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
                   onRemove={removeHandlerFor(track)}
                   onMute={muteHandlerFor(track)}
                   isActiveSpeaker={isActive}
+                  audioOutputDeviceId={audioOutputDeviceId}
                 />
               </div>
             );
@@ -571,6 +589,7 @@ export const VideoGrid: React.FC<VideoGridProps> = ({
               onRemove={removeHandlerFor(track)}
               onMute={muteHandlerFor(track)}
               isActiveSpeaker={isActive}
+              audioOutputDeviceId={audioOutputDeviceId}
             />
           );
         })}

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Mic, MicOff, Video, VideoOff, Monitor, MessageSquare, Radio, CircleDot, PhoneOff, X, FolderDown } from 'lucide-react';
+import { Mic, MicOff, Video, VideoOff, Monitor, MessageSquare, Radio, CircleDot, PhoneOff, X, FolderDown, Settings, Volume2 } from 'lucide-react';
+import { CategorizedDevices, listMediaDevices, playTestSpeakerTone, isSinkIdSupported } from '../services/mediaDevices';
 
 export function validateRtmpUrl(url: string): boolean {
   if (!url) return false;
@@ -18,6 +19,12 @@ interface ControlsProps {
   forceMuteSignal?: number;
   initialMicOn?: boolean;
   initialCamOn?: boolean;
+  selectedMicId?: string;
+  selectedSpeakerId?: string;
+  selectedCamId?: string;
+  onSelectMic?: (deviceId: string) => void;
+  onSelectSpeaker?: (deviceId: string) => void;
+  onSelectCam?: (deviceId: string) => void;
   onToggleMic: () => void;
   onToggleCam: () => void;
   onScreenShare: () => void;
@@ -40,6 +47,12 @@ export const Controls: React.FC<ControlsProps> = ({
   forceMuteSignal,
   initialMicOn = true,
   initialCamOn = true,
+  selectedMicId,
+  selectedSpeakerId,
+  selectedCamId,
+  onSelectMic,
+  onSelectSpeaker,
+  onSelectCam,
   onToggleMic,
   onToggleCam,
   onScreenShare,
@@ -56,8 +69,34 @@ export const Controls: React.FC<ControlsProps> = ({
   const [micOn, setMicOn] = useState(initialMicOn);
   const [camOn, setCamOn] = useState(initialCamOn);
   const [showRtmpModal, setShowRtmpModal] = useState(false);
+  const [showDeviceSettings, setShowDeviceSettings] = useState(false);
+  const [devices, setDevices] = useState<CategorizedDevices>({ microphones: [], speakers: [], cameras: [] });
+  const [isPlayingTest, setIsPlayingTest] = useState(false);
   const [rtmpUrlInput, setRtmpUrlInput] = useState('');
   const [rtmpError, setRtmpError] = useState('');
+
+  // Fetch available media devices and listen to hardware plug/unplug events
+  useEffect(() => {
+    let mounted = true;
+    const updateDevices = () => {
+      listMediaDevices().then((res) => {
+        if (mounted) setDevices(res);
+      });
+    };
+
+    updateDevices();
+
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices?.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', updateDevices);
+      return () => {
+        mounted = false;
+        navigator.mediaDevices.removeEventListener('devicechange', updateDevices);
+      };
+    }
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // BR1: App.tsx already disabled the local track and relayed media_state
   // by the time this fires — this just syncs the mic button's own icon
@@ -138,6 +177,15 @@ export const Controls: React.FC<ControlsProps> = ({
           title="Real-Time Chat"
         >
           <MessageSquare className="w-5 h-5 text-cyan-400" />
+        </button>
+
+        {/* Audio & Video Device Settings */}
+        <button
+          onClick={() => setShowDeviceSettings(true)}
+          className="p-3 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl transition-all duration-200"
+          title="Audio & Video Settings"
+        >
+          <Settings className="w-5 h-5 text-indigo-400" />
         </button>
 
         {/* Host Only Egress Controls */}
@@ -244,6 +292,129 @@ export const Controls: React.FC<ControlsProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Audio & Video Device Settings Modal */}
+      {showDeviceSettings && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-md shadow-2xl relative">
+            <button
+              onClick={() => setShowDeviceSettings(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-slate-200"
+              title="Close Settings"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-3 mb-5">
+              <div className="p-2.5 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-indigo-400">
+                <Settings className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-semibold text-slate-100 text-base">Audio & Video Settings</h3>
+                <p className="text-xs text-slate-400">Pilih mikrofon, speaker, dan kamera</p>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              {/* Microphone Select */}
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
+                  <Mic className="w-3.5 h-3.5 text-indigo-400" />
+                  Microphone
+                </label>
+                <select
+                  aria-label="Select Microphone"
+                  value={selectedMicId || ''}
+                  onChange={(e) => onSelectMic?.(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="">Default Microphone</option>
+                  {devices.microphones.map((d, i) => (
+                    <option key={d.deviceId || i} value={d.deviceId}>
+                      {d.label || `Microphone ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Speaker Select */}
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
+                  <Volume2 className="w-3.5 h-3.5 text-indigo-400" />
+                  Speaker / Output
+                </label>
+                <div className="flex gap-2">
+                  <select
+                    aria-label="Select Speaker"
+                    value={selectedSpeakerId || ''}
+                    onChange={(e) => onSelectSpeaker?.(e.target.value)}
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="">Default Speaker</option>
+                    {devices.speakers.map((d, i) => (
+                      <option key={d.deviceId || i} value={d.deviceId}>
+                        {d.label || `Speaker ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={isPlayingTest}
+                    onClick={async () => {
+                      setIsPlayingTest(true);
+                      try {
+                        await playTestSpeakerTone(selectedSpeakerId);
+                      } finally {
+                        setIsPlayingTest(false);
+                      }
+                    }}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-indigo-400 text-xs font-medium rounded-xl border border-slate-700/50 flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    <Volume2 className="w-3.5 h-3.5" />
+                    {isPlayingTest ? 'Playing…' : 'Test'}
+                  </button>
+                </div>
+                {!isSinkIdSupported() && (
+                  <p className="text-[11px] text-amber-400/80 mt-1">
+                    Browser ini tidak mendukung pemilihan speaker kustom (setSinkId). Menggunakan output default sistem.
+                  </p>
+                )}
+              </div>
+
+              {/* Camera Select */}
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
+                  <Video className="w-3.5 h-3.5 text-indigo-400" />
+                  Camera
+                </label>
+                <select
+                  aria-label="Select Camera"
+                  value={selectedCamId || ''}
+                  onChange={(e) => onSelectCam?.(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="">Default Camera</option>
+                  {devices.cameras.map((d, i) => (
+                    <option key={d.deviceId || i} value={d.deviceId}>
+                      {d.label || `Camera ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-5 mt-4 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setShowDeviceSettings(false)}
+                className="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-xl shadow-lg shadow-indigo-600/30"
+              >
+                Selesai
+              </button>
+            </div>
           </div>
         </div>
       )}

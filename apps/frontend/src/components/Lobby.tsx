@@ -1,6 +1,14 @@
-import React, { useState } from 'react';
-import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, ArrowRight, AlertCircle, UserPlus, LogOut, Mic, MicOff, Video, VideoOff } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Users, PlusCircle, Sparkles, LogIn, ShieldCheck, ArrowRight, AlertCircle, UserPlus, LogOut, Mic, MicOff, Video, VideoOff, Settings, Volume2, X } from 'lucide-react';
 import { login, signup, createRoom, logout, SessionResponse } from '../services/auth';
+import {
+  CategorizedDevices,
+  getPreferredDevices,
+  setPreferredDevice,
+  listMediaDevices,
+  playTestSpeakerTone,
+  isSinkIdSupported,
+} from '../services/mediaDevices';
 
 export function validateJoinInput(name: string, roomSlug: string): { valid: boolean; error?: string } {
   if (!name.trim()) return { valid: false, error: 'Display name is required' };
@@ -17,6 +25,9 @@ export type HostSession = Pick<SessionResponse, 'token' | 'name' | 'role' | 'use
 export interface JoinMediaOptions {
   micOn: boolean;
   camOn: boolean;
+  audioDeviceId?: string;
+  videoDeviceId?: string;
+  speakerDeviceId?: string;
 }
 
 interface LobbyProps {
@@ -34,6 +45,14 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
 
+  const initialPreferred = getPreferredDevices();
+  const [selectedMicId, setSelectedMicId] = useState(initialPreferred.micId);
+  const [selectedSpeakerId, setSelectedSpeakerId] = useState(initialPreferred.speakerId);
+  const [selectedCamId, setSelectedCamId] = useState(initialPreferred.camId);
+  const [showDeviceSettings, setShowDeviceSettings] = useState(false);
+  const [devices, setDevices] = useState<CategorizedDevices>({ microphones: [], speakers: [], cameras: [] });
+  const [isPlayingTest, setIsPlayingTest] = useState(false);
+
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
   const [hostSession, setHostSession] = useState<HostSession | null>(initialHostSession);
   const [prevInitialSession, setPrevInitialSession] = useState<HostSession | null>(initialHostSession);
@@ -49,6 +68,44 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
     setHostSession(initialHostSession);
   }
 
+  // Enumerate connected devices and listen for devicechange events
+  useEffect(() => {
+    let mounted = true;
+    const updateDevices = () => {
+      listMediaDevices().then((res) => {
+        if (mounted) setDevices(res);
+      });
+    };
+
+    updateDevices();
+
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices?.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', updateDevices);
+      return () => {
+        mounted = false;
+        navigator.mediaDevices.removeEventListener('devicechange', updateDevices);
+      };
+    }
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const handleSelectMic = (id: string) => {
+    setSelectedMicId(id);
+    setPreferredDevice('mic', id);
+  };
+
+  const handleSelectSpeaker = (id: string) => {
+    setSelectedSpeakerId(id);
+    setPreferredDevice('speaker', id);
+  };
+
+  const handleSelectCam = (id: string) => {
+    setSelectedCamId(id);
+    setPreferredDevice('cam', id);
+  };
+
   const handleGuestJoin = (e: React.FormEvent) => {
     e.preventDefault();
     const validation = validateJoinInput(guestName, guestRoomSlug);
@@ -57,7 +114,13 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
       return;
     }
     setGuestError('');
-    onJoinRoom(guestName.trim(), guestRoomSlug.trim(), 'guest', { micOn, camOn });
+    onJoinRoom(guestName.trim(), guestRoomSlug.trim(), 'guest', {
+      micOn,
+      camOn,
+      audioDeviceId: selectedMicId || undefined,
+      videoDeviceId: selectedCamId || undefined,
+      speakerDeviceId: selectedSpeakerId || undefined,
+    });
   };
 
   const handleHostAuth = async (e: React.FormEvent) => {
@@ -84,7 +147,13 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
     setHostBusy(true);
     try {
       const roomData = await createRoom(hostRoomSlug.trim(), hostSession.token);
-      onEnterAsHost(hostSession, roomData.room.slug, { micOn, camOn });
+      onEnterAsHost(hostSession, roomData.room.slug, {
+        micOn,
+        camOn,
+        audioDeviceId: selectedMicId || undefined,
+        videoDeviceId: selectedCamId || undefined,
+        speakerDeviceId: selectedSpeakerId || undefined,
+      });
     } catch (err) {
       setHostError(err instanceof Error ? err.message : 'Failed to create room');
       setHostBusy(false);
@@ -173,7 +242,7 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
               </div>
 
               {/* Pre-join Audio & Video Settings */}
-              <div className="flex items-center gap-3 pt-1">
+              <div className="flex items-center gap-2 pt-1">
                 <button
                   type="button"
                   onClick={() => setMicOn(!micOn)}
@@ -197,6 +266,14 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
                 >
                   {camOn ? <Video className="w-3.5 h-3.5 text-emerald-400" /> : <VideoOff className="w-3.5 h-3.5" />}
                   <span>{camOn ? 'Cam Ready' : 'Cam Off'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowDeviceSettings(true)}
+                  className="py-2.5 px-3 rounded-xl border bg-slate-900/90 border-slate-700/80 text-slate-300 hover:text-white hover:border-cyan-500/50 transition-all flex items-center justify-center"
+                  title="Audio & Video Device Settings"
+                >
+                  <Settings className="w-3.5 h-3.5" />
                 </button>
               </div>
 
@@ -256,7 +333,7 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
                 </div>
 
                 {/* Pre-join Audio & Video Settings for Host */}
-                <div className="flex items-center gap-3 pt-1">
+                <div className="flex items-center gap-2 pt-1">
                   <button
                     type="button"
                     onClick={() => setMicOn(!micOn)}
@@ -280,6 +357,14 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
                   >
                     {camOn ? <Video className="w-3.5 h-3.5 text-emerald-400" /> : <VideoOff className="w-3.5 h-3.5" />}
                     <span>{camOn ? 'Cam Ready' : 'Cam Off'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowDeviceSettings(true)}
+                    className="py-2.5 px-3 rounded-xl border bg-slate-900/90 border-slate-700/80 text-slate-300 hover:text-white hover:border-indigo-500/50 transition-all flex items-center justify-center"
+                    title="Audio & Video Device Settings"
+                  >
+                    <Settings className="w-3.5 h-3.5" />
                   </button>
                 </div>
 
@@ -371,6 +456,129 @@ export const Lobby: React.FC<LobbyProps> = ({ initialRoomSlug = '', initialHostS
         <span>•</span>
         <span>Powered by Pion Go WebRTC &amp; Puppeteer Egress</span>
       </div>
+
+      {/* Audio & Video Device Settings Modal */}
+      {showDeviceSettings && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-md shadow-2xl relative">
+            <button
+              onClick={() => setShowDeviceSettings(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-slate-200"
+              title="Close Settings"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-3 mb-5">
+              <div className="p-2.5 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-indigo-400">
+                <Settings className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-semibold text-slate-100 text-base">Audio & Video Settings</h3>
+                <p className="text-xs text-slate-400">Pilih mikrofon, speaker, dan kamera</p>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              {/* Microphone Select */}
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
+                  <Mic className="w-3.5 h-3.5 text-indigo-400" />
+                  Microphone
+                </label>
+                <select
+                  aria-label="Select Microphone"
+                  value={selectedMicId}
+                  onChange={(e) => handleSelectMic(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="">Default Microphone</option>
+                  {devices.microphones.map((d, i) => (
+                    <option key={d.deviceId || i} value={d.deviceId}>
+                      {d.label || `Microphone ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Speaker Select */}
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
+                  <Volume2 className="w-3.5 h-3.5 text-indigo-400" />
+                  Speaker / Output
+                </label>
+                <div className="flex gap-2">
+                  <select
+                    aria-label="Select Speaker"
+                    value={selectedSpeakerId}
+                    onChange={(e) => handleSelectSpeaker(e.target.value)}
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="">Default Speaker</option>
+                    {devices.speakers.map((d, i) => (
+                      <option key={d.deviceId || i} value={d.deviceId}>
+                        {d.label || `Speaker ${i + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={isPlayingTest}
+                    onClick={async () => {
+                      setIsPlayingTest(true);
+                      try {
+                        await playTestSpeakerTone(selectedSpeakerId);
+                      } finally {
+                        setIsPlayingTest(false);
+                      }
+                    }}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-indigo-400 text-xs font-medium rounded-xl border border-slate-700/50 flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    <Volume2 className="w-3.5 h-3.5" />
+                    {isPlayingTest ? 'Playing…' : 'Test'}
+                  </button>
+                </div>
+                {!isSinkIdSupported() && (
+                  <p className="text-[11px] text-amber-400/80 mt-1">
+                    Browser ini tidak mendukung pemilihan speaker kustom (setSinkId). Menggunakan output default sistem.
+                  </p>
+                )}
+              </div>
+
+              {/* Camera Select */}
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
+                  <Video className="w-3.5 h-3.5 text-indigo-400" />
+                  Camera
+                </label>
+                <select
+                  aria-label="Select Camera"
+                  value={selectedCamId}
+                  onChange={(e) => handleSelectCam(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="">Default Camera</option>
+                  {devices.cameras.map((d, i) => (
+                    <option key={d.deviceId || i} value={d.deviceId}>
+                      {d.label || `Camera ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-5 mt-4 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setShowDeviceSettings(false)}
+                className="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-xl shadow-lg shadow-indigo-600/30"
+              >
+                Selesai
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

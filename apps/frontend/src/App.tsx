@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { WebRTCService, ParticipantTrack } from './services/webrtc';
 import { guestJoin, getSession, logout } from './services/auth';
+import { getPreferredDevices, setPreferredDevice } from './services/mediaDevices';
 import { VideoGrid } from './components/VideoGrid';
 import { Controls } from './components/Controls';
 import { Lobby, HostSession, JoinMediaOptions } from './components/Lobby';
@@ -36,6 +37,15 @@ export const App: React.FC = () => {
   const [roomPeers, setRoomPeers] = useState<Array<{ peer_id: string; peer_name: string }>>([]);
   const [initialMicOn, setInitialMicOn] = useState<boolean>(true);
   const [initialCamOn, setInitialCamOn] = useState<boolean>(true);
+
+  const initialPreferred = getPreferredDevices();
+  const [selectedMicId, setSelectedMicId] = useState<string>(initialPreferred.micId);
+  const [selectedSpeakerId, setSelectedSpeakerId] = useState<string>(initialPreferred.speakerId);
+  const [selectedCamId, setSelectedCamId] = useState<string>(initialPreferred.camId);
+  const initialDevicesRef = useRef({
+    audioDeviceId: initialPreferred.micId,
+    videoDeviceId: initialPreferred.camId,
+  });
   // Keyed the same way as remoteMediaState (by peerID/display name) — true
   // while the server's RTP-liveness watchdog has flagged that publisher's
   // track as silent (frozen video that isn't recovering on its own).
@@ -82,6 +92,17 @@ export const App: React.FC = () => {
       if (options) {
         setInitialMicOn(options.micOn);
         setInitialCamOn(options.camOn);
+        if (options.audioDeviceId !== undefined) {
+          setSelectedMicId(options.audioDeviceId);
+          initialDevicesRef.current.audioDeviceId = options.audioDeviceId;
+        }
+        if (options.videoDeviceId !== undefined) {
+          setSelectedCamId(options.videoDeviceId);
+          initialDevicesRef.current.videoDeviceId = options.videoDeviceId;
+        }
+        if (options.speakerDeviceId !== undefined) {
+          setSelectedSpeakerId(options.speakerDeviceId);
+        }
       }
       const authData = await guestJoin(name, targetRoomSlug, role);
       setToken(authData.token);
@@ -108,6 +129,17 @@ export const App: React.FC = () => {
     if (options) {
       setInitialMicOn(options.micOn);
       setInitialCamOn(options.camOn);
+      if (options.audioDeviceId !== undefined) {
+        setSelectedMicId(options.audioDeviceId);
+        initialDevicesRef.current.audioDeviceId = options.audioDeviceId;
+      }
+      if (options.videoDeviceId !== undefined) {
+        setSelectedCamId(options.videoDeviceId);
+        initialDevicesRef.current.videoDeviceId = options.videoDeviceId;
+      }
+      if (options.speakerDeviceId !== undefined) {
+        setSelectedSpeakerId(options.speakerDeviceId);
+      }
     }
     setToken(session.token);
     setUserRole(session.role || 'host');
@@ -316,6 +348,8 @@ export const App: React.FC = () => {
           isEgress: userRole === 'egress',
           initialMicOn,
           initialCamOn,
+          audioDeviceId: initialDevicesRef.current.audioDeviceId || undefined,
+          videoDeviceId: initialDevicesRef.current.videoDeviceId || undefined,
         });
         setConnectionLost(false);
         setLocalStream(service.getLocalStream());
@@ -466,6 +500,31 @@ export const App: React.FC = () => {
     webrtcService?.setPresentation(peerId);
   };
 
+  const handleSelectMic = async (deviceId: string) => {
+    setSelectedMicId(deviceId);
+    initialDevicesRef.current.audioDeviceId = deviceId;
+    setPreferredDevice('mic', deviceId);
+    if (webrtcService) {
+      const stream = await webrtcService.switchAudioInput(deviceId);
+      if (stream) setLocalStream(stream);
+    }
+  };
+
+  const handleSelectCam = async (deviceId: string) => {
+    setSelectedCamId(deviceId);
+    initialDevicesRef.current.videoDeviceId = deviceId;
+    setPreferredDevice('cam', deviceId);
+    if (webrtcService) {
+      const stream = await webrtcService.switchVideoInput(deviceId);
+      if (stream) setLocalStream(stream);
+    }
+  };
+
+  const handleSelectSpeaker = (deviceId: string) => {
+    setSelectedSpeakerId(deviceId);
+    setPreferredDevice('speaker', deviceId);
+  };
+
   if (!inMeeting) {
     if (!sessionChecked) {
       return <div className="min-h-screen w-full bg-slate-950" />;
@@ -541,6 +600,7 @@ export const App: React.FC = () => {
           activePresentation={activePresentation}
           onSetPresentation={userRole === 'host' ? handleSetPresentation : undefined}
           roomPeers={roomPeers}
+          audioOutputDeviceId={selectedSpeakerId}
         />
 
         {/* Removal takeover notice: unlike a dropped connection, there's
@@ -654,6 +714,12 @@ export const App: React.FC = () => {
           forceMuteSignal={forceMuteSignal}
           initialMicOn={initialMicOn}
           initialCamOn={initialCamOn}
+          selectedMicId={selectedMicId}
+          selectedSpeakerId={selectedSpeakerId}
+          selectedCamId={selectedCamId}
+          onSelectMic={handleSelectMic}
+          onSelectSpeaker={handleSelectSpeaker}
+          onSelectCam={handleSelectCam}
           onToggleMic={() => {
             if (localStream) {
               localStream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
